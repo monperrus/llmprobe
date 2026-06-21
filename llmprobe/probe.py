@@ -1223,6 +1223,53 @@ def create_agent_file(model: str, safe_model: str, endpoint: str = "", key_name:
     return agent_path
 
 
+# -- load_or_probe ------------------------------------------------------------
+
+def load_or_probe(
+    model: str,
+    endpoint: str = ENDPOINT,
+    force: bool = False,
+    key_name: str = "OPENROUTER_API_KEY",
+    auth: str = "auto",
+) -> dict:
+    """Return a cached or freshly-probed agent spec dict for *model*.
+
+    Looks for a cached spec in ``~/.local/share/agent_probe/``.  If none is
+    found (or *force* is True) the full probe sequence is run against the live
+    API and the result is written to that directory.
+
+    """
+    global ENDPOINT, MODEL, AUTH
+
+    if auth == "auto" or auth is None:
+        auth = "x-api-key" if "opencode.ai" in endpoint else "bearer"
+
+    ENDPOINT = endpoint
+    MODEL    = model
+    AUTH     = auth
+
+    safe      = model.replace("/", "_").replace(":", "_")
+    safe_name = model.split("/", 1)[-1].replace(":", "_")
+    out_path  = _DEFAULT_DATA_DIR / f"agent_spec_{safe}.json"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    if not force:
+        cached = _load_cached_output(out_path)
+        if cached is not None:
+            return cached
+
+    _init_probe_dir(safe)
+
+    import argparse as _argparse
+    _args = _argparse.Namespace(
+        tool=None, quote_test=False, tool_call_type_only=False,
+        force_reprobe=force, key_name=key_name,
+        endpoint=endpoint, model=model, auth=auth,
+        quick_summary=False, output=str(out_path),
+    )
+    return _probe_and_build_output(_args, safe, safe_name, str(out_path))
+
+
 # -- main ---------------------------------------------------------------------
 
 def _run_probe_silently(quiet: bool):
