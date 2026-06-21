@@ -68,6 +68,9 @@ AUTH     = "auto"   # "bearer", "x-api-key", or "auto" (detect from endpoint)
 
 _PROBE_DIR: Path | None = None
 
+# Default base directory for all probe outputs
+_DEFAULT_DATA_DIR = Path.home() / ".local" / "share" / "agent_probe"
+
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Probe a model's preferred tool names/parameters.")
@@ -177,7 +180,7 @@ def make_client(api_key: str) -> openai.OpenAI:
 
 def _init_probe_dir(safe_model: str) -> None:
     global _PROBE_DIR
-    _PROBE_DIR = Path("probes") / safe_model
+    _PROBE_DIR = _DEFAULT_DATA_DIR / "probes" / safe_model
     _PROBE_DIR.mkdir(parents=True, exist_ok=True)
 
 
@@ -1058,8 +1061,11 @@ def _tool_param_signature(tool: dict) -> str:
 def quick_summary() -> None:
     import glob
     paths = sorted(glob.glob("agent_spec_*.json"))
+    # Also search in the default data directory
+    data_dir_paths = sorted(glob.glob(str(_DEFAULT_DATA_DIR / "agent_spec_*.json")))
+    paths = paths + data_dir_paths
     if not paths:
-        print("No agent_spec_*.json files found in the current directory.")
+        print("No agent_spec_*.json files found in the current directory or {_DEFAULT_DATA_DIR}.")
         return
 
     structured_list: list[dict] = []
@@ -1177,15 +1183,12 @@ Usage:
     agent-{model} --non-interactive  # disable ask_user_question tool
 """
 
-import os, sys, importlib.util
+import os, sys
 
-project_root = os.path.dirname(os.path.realpath(__file__))
-sys.path.insert(0, project_root)
-script_path = os.path.join(project_root, "agent_probe.py")
+from pathlib import Path
+sys.path.insert(0, str(Path.home() / ".local/share/agent_probe"))
 
-spec = importlib.util.spec_from_file_location("agent_probe", script_path)
-agent_probe = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(agent_probe)
+from llmprobe.probe import main as agent_probe_main
 
 _k = os.environ.get({key_name_repr}, "")
 if _k:
@@ -1194,14 +1197,14 @@ if _k:
 sys.argv.insert(1, {model_repr})
 sys.argv.insert(2, "--endpoint")
 sys.argv.insert(3, {endpoint_repr})
-agent_probe.main()
+agent_probe_main()
 '''
 
 
 def create_agent_file(model: str, safe_model: str, endpoint: str = "", key_name: str = "OPENROUTER_API_KEY") -> Path:
-    """Write agent-<safe_model>.py in the current working directory and symlink it into ~/bin."""
-    here       = Path.cwd()
-    agent_path = here / f"agent-{safe_model}.py"
+    """Write agent-<safe_model>.py in the data dir and symlink it into ~/bin."""
+    agent_path = _DEFAULT_DATA_DIR / f"agent-{safe_model}.py"
+    agent_path.parent.mkdir(parents=True, exist_ok=True)
     agent_path.write_text(_AGENT_TEMPLATE.format(
         model=model,
         model_repr=repr(model),
@@ -1254,7 +1257,7 @@ def main():
 
     safe_model      = MODEL.replace("/", "_").replace(":", "_")
     safe_model_name = MODEL.split("/", 1)[-1].replace(":", "_")  # drop provider prefix for agent filename
-    out_path        = args.output or f"agent_spec_{safe_model}.json"
+    out_path        = args.output or str(_DEFAULT_DATA_DIR / f"agent_spec_{safe_model}.json")
 
     quiet = args.tool_call_type_only
 
@@ -1318,6 +1321,7 @@ def _probe_and_build_output(args, safe_model: str, safe_model_name: str, out_pat
     def save(note: str = ""):
         if single_op:
             return
+        Path(out_path).parent.mkdir(parents=True, exist_ok=True)
         with open(out_path, "w") as f:
             json.dump(output, f, indent=2)
         msg = f"\nReport written to {out_path}"
