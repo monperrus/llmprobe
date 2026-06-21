@@ -55,6 +55,7 @@ import sys
 from pathlib import Path
 from textwrap import indent
 
+import httpx
 import openai
 
 from llmprobe.exceptions import AgentProbeError, AuthenticationError
@@ -63,6 +64,7 @@ from llmprobe.exceptions import AgentProbeError, AuthenticationError
 
 ENDPOINT = "https://openrouter.ai/api/v1"
 MODEL    = "qwen2.5-coder:7b"
+AUTH     = "auto"   # "bearer", "x-api-key", or "auto" (detect from endpoint)
 
 _PROBE_DIR: Path | None = None
 
@@ -92,6 +94,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--force-reprobe", action="store_true", dest="force_reprobe",
                    help="Ignore any cached agent_spec JSON (even if fresh) and re-run all "
                         "probe rounds against the live API.")
+    p.add_argument("--auth", default=None,
+                   help="Authentication type: 'bearer' (default for OpenRouter), "
+                        "'x-api-key' (e.g. opencode.ai/zen).  If omitted, auto-detected "
+                        "from endpoint URL when it contains 'opencode.ai'.")
     return p.parse_args()
 
 
@@ -123,6 +129,17 @@ def get_api_key(key_name: str = "OPENROUTER_API_KEY") -> str:
     if key_name == "OPENROUTER_API_KEY":
         from openrouter_key import ensure_api_key
         return ensure_api_key()
+    if key_name == "OPENCODE_API_KEY" or key_name == "opencode":
+        try:
+            import json
+            token = json.loads(
+                (Path.home() / ".local/share/opencode/auth.json").read_text()
+            ).get("github-copilot", {}).get("access")
+            if token:
+                return token
+        except Exception:
+            pass
+        raise AuthenticationError("Cannot obtain opencode API key from ~/.local/share/opencode/auth.json")
     key = os.environ.get(key_name)
     if key:
         return key
@@ -139,6 +156,22 @@ def get_api_key(key_name: str = "OPENROUTER_API_KEY") -> str:
 # -- helpers ------------------------------------------------------------------
 
 def make_client(api_key: str) -> openai.OpenAI:
+    if AUTH == "x-api-key":
+        # X-API-Key auth (opencode.ai/zen and similar)
+        class _XAPIKeyAuth(httpx.Auth):
+            def __init__(self, token: str):
+                self.token = token
+            def auth_flow(self, request):
+                request.headers.pop("Authorization", None)
+                request.headers["X-API-Key"] = self.token
+                yield request
+        http_client = httpx.Client(auth=_XAPIKeyAuth(api_key))
+        return openai.OpenAI(
+            api_key="unused",
+            base_url=ENDPOINT,
+            http_client=http_client,
+        )
+    # Default: standard Bearer auth
     return openai.OpenAI(api_key=api_key, base_url=ENDPOINT)
 
 
@@ -1198,7 +1231,7 @@ def _run_probe_silently(quiet: bool):
 
 
 def main():
-    global ENDPOINT, MODEL
+    global ENDPOINT, MODEL, AUTH
 
     args = parse_args()
     if args.quick_summary:
@@ -1208,6 +1241,16 @@ def main():
         ENDPOINT = args.endpoint
     if args.model:
         MODEL = args.model
+    if args.auth:
+        AUTH = args.auth
+    # Auto-detect key-name from endpoint if not explicitly set
+    if args.key_name == "OPENROUTER_API_KEY" and "opencode.ai" in ENDPOINT:
+        args.key_name = "opencode"
+    if AUTH == "auto" or AUTH is None:
+        if "opencode.ai" in ENDPOINT:
+            AUTH = "x-api-key"
+        else:
+            AUTH = "bearer"
 
     safe_model      = MODEL.replace("/", "_").replace(":", "_")
     safe_model_name = MODEL.split("/", 1)[-1].replace(":", "_")  # drop provider prefix for agent filename
