@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "llmprobe"
+version = "0.1.0"
+description = "Probe any OpenAI-compatible model's tool-call behaviour and fingerprint its preferred tool names and parameters."
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+dependencies = [
+    "openai>=1.0",
+]
+
+[project.optional-dependencies]
+keyring = ["keyring>=25"]
+
+[project.scripts]
+llmprobe = "llmprobe:main"
+
+[tool.setuptools.packages.find]
+include = ["llmprobe*"]
+
+[tool.pytest.ini_options]
+testpaths = ["."]
+python_files = ["test_*.py"]
