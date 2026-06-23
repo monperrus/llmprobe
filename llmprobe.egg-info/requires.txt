@@ -1,4 +1,0 @@
-openai>=1.0
-
-[keyring]
-keyring>=25
