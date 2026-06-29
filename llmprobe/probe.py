@@ -65,6 +65,7 @@ from llmprobe.exceptions import AgentProbeError, AuthenticationError
 ENDPOINT = "https://openrouter.ai/api/v1"
 MODEL    = "qwen2.5-coder:7b"
 AUTH     = "auto"   # "bearer", "x-api-key", or "auto" (detect from endpoint)
+REQUEST_TIMEOUT = 300
 
 _PROBE_DIR: Path | None = None
 
@@ -200,7 +201,7 @@ def _save_probe(label: str, messages: list[dict],
 
 def chat(client: openai.OpenAI, messages: list[dict], tools: list[dict] | None = None,
          tool_choice="auto") -> openai.types.chat.ChatCompletion:
-    kwargs: dict = dict(model=MODEL, messages=messages, temperature=0, timeout=300)
+    kwargs: dict = dict(model=MODEL, messages=messages, temperature=0, timeout=REQUEST_TIMEOUT)
     if tools:
         kwargs["tools"] = tools
         kwargs["tool_choice"] = tool_choice
@@ -208,7 +209,7 @@ def chat(client: openai.OpenAI, messages: list[dict], tools: list[dict] | None =
         return client.chat.completions.create(**kwargs)
     except openai.APITimeoutError as e:
         raise AgentProbeError(
-            f"LLM call timed out after 300 seconds. Model={MODEL}, "
+            f"LLM call timed out after {REQUEST_TIMEOUT} seconds. Model={MODEL}, "
             f"messages={json.dumps(messages, indent=2, default=str)[:500]}..."
         ) from e
 
@@ -1231,6 +1232,8 @@ def load_or_probe(
     force: bool = False,
     key_name: str = "OPENROUTER_API_KEY",
     auth: str = "auto",
+    quiet: bool = False,
+    request_timeout: int = 300,
 ) -> dict:
     """Return a cached or freshly-probed agent spec dict for *model*.
 
@@ -1239,7 +1242,7 @@ def load_or_probe(
     API and the result is written to that directory.
 
     """
-    global ENDPOINT, MODEL, AUTH
+    global ENDPOINT, MODEL, AUTH, REQUEST_TIMEOUT
 
     if auth == "auto" or auth is None:
         auth = "x-api-key" if "opencode.ai" in endpoint else "bearer"
@@ -1247,6 +1250,7 @@ def load_or_probe(
     ENDPOINT = endpoint
     MODEL    = model
     AUTH     = auth
+    REQUEST_TIMEOUT = request_timeout
 
     safe      = model.replace("/", "_").replace(":", "_")
     safe_name = model.split("/", 1)[-1].replace(":", "_")
@@ -1267,7 +1271,8 @@ def load_or_probe(
         endpoint=endpoint, model=model, auth=auth,
         quick_summary=False, output=str(out_path),
     )
-    return _probe_and_build_output(_args, safe, safe_name, str(out_path))
+    with _run_probe_silently(quiet):
+        return _probe_and_build_output(_args, safe, safe_name, str(out_path))
 
 
 # -- main ---------------------------------------------------------------------
