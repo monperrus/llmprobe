@@ -83,7 +83,36 @@ tool.
 
 ## `GRAM`
 
-**Capability:** The *endpoint* implements OpenAI's real freeform/custom-tool
+**Capability:** Endpoint honours a genuine OpenAI custom/freeform tool
+(`type:"custom"`, `format:{type:"grammar", syntax:"lark", ...}`) end to end —
+a `custom` tool_call comes back with grammar-valid input, rather than the
+endpoint falling back to classic function calling or rejecting the request.
+
+- **Unit:** tasks passed / tasks run
+- **Range:** 0 to 1 task
+- **Source:** `gram_test` (enabled with `--gram-test`)
+
+## `RJSON`
+
+**Capability:** Endpoint honours strict structured output — a
+`response_format:{type:"json_schema"}` request (no tool schema) is accepted
+and the reply content parses as JSON conforming to the given schema. Like
+`GRAM`, this is an endpoint/provider feature, not a model behaviour.
+
+- **Unit:** tasks passed / tasks run
+- **Range:** 0 to 1 task
+- **Source:** `rjson_test` (enabled with `--rjson-test`)
+
+## `TSEL`
+
+**Capability:** Model calls the tool it itself proposed for an operation
+during Round 1 elicitation, rather than substituting a different tool
+when both are available in the offered schema. See `dispatch_conflicts`
+in the report for which tool the model substituted instead.
+
+## GRAM detail
+
+The *endpoint* implements OpenAI's real freeform/custom-tool
 transport end to end — `type: "custom"` with
 `format: {type: "grammar", syntax: "lark", ...}` — rather than only classic
 JSON-schema function calling. Sends the actual upstream `apply_patch.lark`
@@ -106,7 +135,7 @@ tools through instead of silently dropping them. See
 
 ## Notes on scoring
 
-- All seven capabilities are pass/fail per task; the reported value is
+- All eight capabilities are pass/fail per task; the reported value is
   `passed/total`, not a normalized score. Compare N against the same
   codename's range before comparing two models' fractions.
 - `TCALL` is measured twice at different granularity: once as a single
@@ -115,8 +144,10 @@ tools through instead of silently dropping them. See
   (`behaviour.structured_tool_calls` / `.inline_json_in_content` /
   `.no_call_detected`). The markdown report shows both under one `TCALL`
   heading.
-- `QUOTE`, `GREP`, and `ASKQ` are opt-in (`--quote-test` / `--efficiency-test`
-  / `--askq-test`); when not requested, their JSON field is `null` and the
+- `QUOTE`, `GREP`, `ASKQ`, `PATCH`, `GRAM`, and `RJSON` are opt-in
+  (`--quote-test` / `--efficiency-test` / `--askq-test` / `--patch-test` /
+  `--gram-test` / `--rjson-test`); when not requested, their JSON field is
+  `null` and the
   markdown report omits the section. `TSEL` has no flag — it's always
   available once the main probe runs.
 - `TSEL` failures are what used to show up as a bare, uncoded "Tool X was

@@ -85,6 +85,11 @@ def parse_args() -> argparse.Namespace:
                         "tool (type:'custom', format:{type:'grammar', syntax:'lark'}) "
                         "and checks whether the endpoint honours it end to end, "
                         "instead of falling back to classic function calling.")
+    p.add_argument("--rjson-test", action="store_true", dest="rjson_test",
+                   help="Run an extra round that sends a strict "
+                        "response_format:{type:'json_schema'} request (no tool schema) "
+                        "and checks whether the endpoint honours schema-constrained "
+                        "structured output end to end.")
     p.add_argument("--api-type", default="openai-completions",
                    choices=["openai-completions", "openai-responses", "anthropic-messages"],
                    help="The *actual* backend transport behind the endpoint/script, for "
@@ -200,7 +205,7 @@ _RESULT_KEYS = (
     "format_detection", "elicited_names", "inferred_tool_schema",
     "behaviour", "tool_dispatch", "dispatch_conflicts",
     "quote_test", "token_efficiency_test", "askq_test",
-    "patch_syntax_test", "gram_test",
+    "patch_syntax_test", "gram_test", "rjson_test",
 )
 
 
@@ -1521,6 +1526,76 @@ def _build_custom_tool(name: str, description: str, grammar: str) -> dict:
     }
 
 
+# -- RJSON test ---------------------------------------------------------------
+#
+# Sends a strict response_format:{type:'json_schema'} request with no tool
+# schema, and checks whether the endpoint honours schema-constrained
+# structured output end to end -- i.e. genuine constrained decoding on the
+# response body, not just the model being good at writing JSON.  This is an
+# endpoint/provider feature, deliberately separate from the model-behaviour
+# capabilities (TCALL & co).  Mirrors the GRAM test, which does the same for
+# grammar-constrained custom tools.
+
+_RJSON_SCHEMA = {
+    "type": "object",
+    "properties": {"value": {"type": "string"}},
+    "required": ["value"],
+    "additionalProperties": False,
+}
+
+
+def response_format_test_round(client: openai.OpenAI) -> dict:
+    section("RJSON test -- does the endpoint support strict json_schema responses?")
+    print("\nSends response_format:{type:'json_schema', strict:true} with no tool schema --")
+    print("PASS = the request is accepted and the reply parses as JSON conforming to")
+    print("the schema. FAIL = the endpoint rejects the request, or the content does")
+    print("not conform.\n")
+
+    entry: dict = {"pass": False, "supported": False, "schema_conformant": None, "error": None}
+    messages = [
+        {"role": "system", "content": "You are a helpful coding assistant."},
+        {"role": "user",   "content": "Reply with the word 'hello'."},
+    ]
+    try:
+        resp = client.chat.completions.create(
+            model=MODEL,
+            messages=messages,
+            temperature=0,
+            timeout=300,
+            response_format={
+                "type": "json_schema",
+                "json_schema": {"name": "answer", "strict": True, "schema": _RJSON_SCHEMA},
+            },
+        )
+    except Exception as e:
+        entry["error"] = f"request failed: {str(e)[:500]}"
+        print(f"[json_schema] FAIL -- {entry['error']}")
+        return {"rjson_results": {"json_schema": entry},
+                "rjson_passed": 0, "rjson_total": 1}
+
+    _save_probe("rjson_json_schema", messages, resp)
+    entry["supported"] = True
+    content = resp.choices[0].message.content or ""
+    try:
+        parsed = json.loads(content)
+        conformant = isinstance(parsed, dict) and isinstance(parsed.get("value"), str)
+    except json.JSONDecodeError:
+        parsed, conformant = None, False
+    entry["schema_conformant"] = conformant
+    entry["parsed_value"]      = parsed.get("value") if conformant else None
+    # Head + tail so a thinking-token prefix doesn't hide the actual JSON.
+    entry["raw_content"] = content[:100] + ("…" + content[-100:] if len(content) > 200 else content[100:])
+    entry["pass"] = bool(conformant)
+    verdict = "PASS" if conformant else "FAIL"
+    print(f"[json_schema] {verdict} -- supported, conformant={conformant}, "
+          f"content={content[:120]!r}")
+
+    passed = 1 if conformant else 0
+    print(f"\nRJSON summary: {passed}/1 passed")
+    return {"rjson_results": {"json_schema": entry},
+            "rjson_passed": passed, "rjson_total": 1}
+
+
 def constrained_decoding_test_round(client: openai.OpenAI) -> dict:
     section("GRAM test -- does the endpoint support real constrained-decoding custom tools?")
     print("\nSends a type:'custom' tool with format:{type:'grammar', syntax:'lark', ...} --")
@@ -1615,6 +1690,7 @@ def render_markdown_report(output: dict) -> str:
     askq_test  = output.get("askq_test")
     patch_test = output.get("patch_syntax_test")
     gram_test  = output.get("gram_test")
+    rjson_test = output.get("rjson_test")
 
     lines.append("## Capabilities summary")
     lines.append("")
@@ -1650,6 +1726,10 @@ def render_markdown_report(output: dict) -> str:
         lines.append(f"| `GRAM` | {gram_test.get('gram_passed', 0)}/{gram_test.get('gram_total', 0)} |")
     else:
         lines.append("| `GRAM` | *(not run — pass `--gram-test`)* |")
+    if rjson_test and "error" not in rjson_test:
+        lines.append(f"| `RJSON` | {rjson_test.get('rjson_passed', 0)}/{rjson_test.get('rjson_total', 0)} |")
+    else:
+        lines.append("| `RJSON` | *(not run — pass `--rjson-test`)* |")
     dispatch_conflicts = output.get("dispatch_conflicts") or {}
     elicited_names_all = output.get("elicited_names") or {}
     tsel_total = sum(1 for fn in elicited_names_all.values() if fn)
@@ -1866,6 +1946,32 @@ def render_markdown_report(output: dict) -> str:
         lines.append(f"Error: {gram_test['error']}")
         lines.append("")
 
+    if rjson_test and "error" not in rjson_test:
+        results = rjson_test.get("rjson_results") or {}
+        passed  = rjson_test.get("rjson_passed", 0)
+        total   = rjson_test.get("rjson_total", 0)
+        lines.append("## Structured-output test (`RJSON`)")
+        lines.append("")
+        lines.append(f"**{passed}/{total} passed** — sends a strict "
+                     "`response_format:{type:\"json_schema\"}` request with no tool schema; "
+                     "PASS requires the endpoint to accept the request and return content "
+                     "that parses as JSON conforming to the schema. Tests the *endpoint's* "
+                     "structured-output support, independent of tool calling.")
+        lines.append("")
+        lines.append("| Task | Result | Conformant | Notes |")
+        lines.append("|---|---|---|---|")
+        for op, r in results.items():
+            result = "PASS" if r.get("pass") else "FAIL"
+            conf   = "yes" if r.get("schema_conformant") else "no"
+            note   = _md_escape(r.get("error") or "")
+            lines.append(f"| {op} | {result} | {conf} | {note} |")
+        lines.append("")
+    elif rjson_test and rjson_test.get("error"):
+        lines.append("## Structured-output test (`RJSON`)")
+        lines.append("")
+        lines.append(f"Error: {rjson_test['error']}")
+        lines.append("")
+
     lines.append("## Missing capabilities")
     lines.append("")
     problems = _find_missing_capabilities(output)
@@ -1974,6 +2080,16 @@ def _find_missing_capabilities(output: dict) -> list[str]:
             if not r.get("pass"):
                 problems.append(f"`GRAM_{op}` FAILED — {r.get('error', 'unknown reason')}")
 
+    rjson_test = output.get("rjson_test")
+    if rjson_test is None:
+        problems.append("`RJSON` capability not tested (rerun with --rjson-test).")
+    elif rjson_test.get("error"):
+        problems.append(f"`RJSON` test failed to run: {rjson_test['error']}")
+    else:
+        for op, r in (rjson_test.get("rjson_results") or {}).items():
+            if not r.get("pass"):
+                problems.append(f"`RJSON_{op}` FAILED — {r.get('error', 'unknown reason')}")
+
     return problems
 
 
@@ -2029,6 +2145,7 @@ def main():
         "askq_test":            None,
         "patch_syntax_test":    None,
         "gram_test":            None,
+        "rjson_test":           None,
     }
 
     md_path = _capabilities_md_path(out_path)
@@ -2184,6 +2301,18 @@ def main():
             else:
                 output["gram_test"] = {"error": str(e)}
                 print(f"\nERROR in GRAM test round: {e}")
+
+    if args.rjson_test:
+        try:
+            rt = response_format_test_round(client)
+            output["rjson_test"] = rt
+        except Exception as e:
+            if _keep_previous_result(e, previous, "rjson_test"):
+                output["rjson_test"] = previous["rjson_test"]
+                print(f"\nERROR in RJSON test round (429): {e} -- keeping previous run's result")
+            else:
+                output["rjson_test"] = {"error": str(e)}
+                print(f"\nERROR in RJSON test round: {e}")
 
     save()
 
