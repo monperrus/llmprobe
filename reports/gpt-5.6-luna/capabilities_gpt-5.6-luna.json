@@ -272,15 +272,15 @@
   "rjson_test": {
     "rjson_results": {
       "json_schema": {
-        "pass": false,
+        "pass": true,
         "supported": true,
-        "schema_conformant": false,
+        "schema_conformant": true,
         "error": null,
-        "parsed_value": null,
-        "raw_content": "hello"
+        "parsed_value": "hello",
+        "raw_content": "{\"value\":\"hello\"}"
       }
     },
-    "rjson_passed": 0,
+    "rjson_passed": 1,
     "rjson_total": 1
   }
 }

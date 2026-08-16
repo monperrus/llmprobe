@@ -15,7 +15,7 @@ See `CAPABILITIES.md` for what each codename measures, its unit, and its range.
 | `ASKQ` | *(not run — pass `--askq-test`)* |
 | `PATCH` | *(not run — pass `--patch-test`)* |
 | `GRAM` | 1/1 |
-| `RJSON` | 0/1 |
+| `RJSON` | 1/1 |
 | `TSEL` | 7/8 |
 
 ## Format detection & call delivery (`TCALL`)
@@ -136,11 +136,11 @@ Perform the 'glob' operation.
 
 ## Structured-output test (`RJSON`)
 
-**0/1 passed** — sends a strict `response_format:{type:"json_schema"}` request with no tool schema; PASS requires the endpoint to accept the request and return content that parses as JSON conforming to the schema. Tests the *endpoint's* structured-output support, independent of tool calling.
+**1/1 passed** — sends a strict `response_format:{type:"json_schema"}` request with no tool schema; PASS requires the endpoint to accept the request and return content that parses as JSON conforming to the schema. Tests the *endpoint's* structured-output support, independent of tool calling.
 
 | Task | Result | Conformant | Notes |
 |---|---|---|---|
-| json_schema | FAIL | no |  |
+| json_schema | PASS | yes |  |
 
 ## Missing capabilities
 
@@ -151,4 +151,3 @@ Perform the 'glob' operation.
 - `GREP` capability not tested (rerun with --efficiency-test).
 - `ASKQ` capability not tested (rerun with --askq-test).
 - `PATCH` capability not tested (rerun with --patch-test).
-- `RJSON_json_schema` FAILED — None
