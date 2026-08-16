@@ -181,6 +181,75 @@ def _init_probe_dir(safe_model: str) -> None:
     _PROBE_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _load_previous_report(out_path: str) -> dict:
+    """Load a previous run's report, if any, so results can be preserved."""
+    path = Path(out_path)
+    if not path.exists():
+        return {}
+    try:
+        with open(path) as f:
+            previous = json.load(f)
+        return previous if isinstance(previous, dict) else {}
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"WARNING: ignoring unreadable previous report {out_path}: {e}")
+        return {}
+
+
+_RESULT_KEYS = (
+    "status", "error",
+    "format_detection", "elicited_names", "inferred_tool_schema",
+    "behaviour", "tool_dispatch", "dispatch_conflicts",
+    "quote_test", "token_efficiency_test", "askq_test",
+    "patch_syntax_test", "gram_test",
+)
+
+
+def _is_rate_limit_error(exc: Exception) -> bool:
+    """True for quota/rate-limit failures (429) whose results should be kept."""
+    status = getattr(exc, "status_code", None)
+    if status == 429:
+        return True
+    text = str(exc)
+    return "429" in text or "rate limit" in text.lower() or "limit exhausted" in text.lower()
+
+
+def _restore_previous_on_429(previous: dict, output: dict) -> None:
+    """Copy every usable previous-run result into `output`.
+
+    Used when this run dies on a 429 quota/rate-limit error: keys for which
+    the current run already holds a usable result keep it; the rest are
+    restored from the previous report so a quota-exhausted rerun never wipes
+    a good earlier answer.
+    """
+    for key in _RESULT_KEYS:
+        current = output.get(key)
+        fresh = bool(current) and not (isinstance(current, dict) and set(current.keys()) == {"error"})
+        if fresh:
+            continue
+        prev = previous.get(key)
+        if not prev:
+            continue
+        if isinstance(prev, dict) and set(prev.keys()) == {"error"}:
+            continue
+        output[key] = prev
+
+
+def _keep_previous_result(exc: Exception, previous: dict, key: str) -> bool:
+    """Decide whether to keep the previous run's result for `key` on failure.
+
+    True when this run failed on a 429 quota/rate-limit error and the
+    previous report holds a usable (non-empty, non-error) result for `key`.
+    """
+    if not _is_rate_limit_error(exc):
+        return False
+    prev = previous.get(key)
+    if not prev:
+        return False
+    if isinstance(prev, dict) and set(prev.keys()) == {"error"}:
+        return False
+    return True
+
+
 def _save_probe(label: str, messages: list[dict],
                 resp: openai.types.chat.ChatCompletion,
                 tools: list[dict] | None = None) -> None:
@@ -1941,6 +2010,7 @@ def main():
         return
 
     _init_probe_dir(safe_model)
+    previous = _load_previous_report(out_path)
 
     output: dict = {
         "model":                MODEL,
@@ -1988,8 +2058,12 @@ def main():
         if "No endpoints found that support tool use" in str(e):
             print(f"\nModel does not support tool use -- aborting.")
             raise SystemExit(1)
-        output["format_detection"] = {"error": str(e)}
-        print(f"\nWARNING in Round 0: {e}")
+        if _keep_previous_result(e, previous, "format_detection"):
+            output["format_detection"] = previous["format_detection"]
+            print(f"\nWARNING in Round 0 (429): {e} -- keeping previous run's result")
+        else:
+            output["format_detection"] = {"error": str(e)}
+            print(f"\nWARNING in Round 0: {e}")
 
     try:
         elicited = elicit_round(client)
@@ -1997,8 +2071,14 @@ def main():
         output["elicited_names"] = {op: v["function_name"] for op, v in elicited.items()}
     except Exception as e:
         output["error"] = f"elicit_round failed: {e}"
+        kept = _keep_previous_result(e, previous, "elicited_names")
+        if kept:
+            _restore_previous_on_429(previous, output)
+            output["status"] = "ok"
         print(f"\nERROR in Round 1: {e}")
-        save("failed at Round 1")
+        if kept:
+            print("429: keeping previous run's results")
+        save("failed at Round 1" + (" -- previous results kept" if kept else ""))
         raise SystemExit(1)
 
     initial_tools = build_tool_schema(elicited)
@@ -2007,8 +2087,14 @@ def main():
         probe_calls = probe_round(client, initial_tools)
     except Exception as e:
         output["error"] = f"probe_round failed: {e}"
+        kept = _keep_previous_result(e, previous, "behaviour")
+        if kept:
+            _restore_previous_on_429(previous, output)
+            output["status"] = "ok"
         print(f"\nERROR in Round 2: {e}")
-        save("failed at Round 2 -- elicited names preserved")
+        if kept:
+            print("429: keeping previous run's results")
+        save("failed at Round 2 -- elicited names preserved" + (" -- previous results kept" if kept else ""))
         raise SystemExit(1)
 
     final_tools  = initial_tools
@@ -2043,16 +2129,24 @@ def main():
             qt = quote_test_round(client, final_tools, output["elicited_names"])
             output["quote_test"] = qt
         except Exception as e:
-            output["quote_test"] = {"error": str(e)}
-            print(f"\nERROR in quote-test round: {e}")
+            if _keep_previous_result(e, previous, "quote_test"):
+                output["quote_test"] = previous["quote_test"]
+                print(f"\nERROR in quote-test round (429): {e} -- keeping previous run's result")
+            else:
+                output["quote_test"] = {"error": str(e)}
+                print(f"\nERROR in quote-test round: {e}")
 
     if args.efficiency_test:
         try:
             et = token_efficiency_test_round(client, final_tools, output.get("tool_dispatch") or {})
             output["token_efficiency_test"] = et
         except Exception as e:
-            output["token_efficiency_test"] = {"error": str(e)}
-            print(f"\nERROR in token-efficiency test round: {e}")
+            if _keep_previous_result(e, previous, "token_efficiency_test"):
+                output["token_efficiency_test"] = previous["token_efficiency_test"]
+                print(f"\nERROR in token-efficiency test round (429): {e} -- keeping previous run's result")
+            else:
+                output["token_efficiency_test"] = {"error": str(e)}
+                print(f"\nERROR in token-efficiency test round: {e}")
 
     if args.askq_test:
         try:
@@ -2060,24 +2154,36 @@ def main():
             aq = ask_user_question_test_round(client, final_tools, ask_tool_name)
             output["askq_test"] = aq
         except Exception as e:
-            output["askq_test"] = {"error": str(e)}
-            print(f"\nERROR in ASKQ test round: {e}")
+            if _keep_previous_result(e, previous, "askq_test"):
+                output["askq_test"] = previous["askq_test"]
+                print(f"\nERROR in ASKQ test round (429): {e} -- keeping previous run's result")
+            else:
+                output["askq_test"] = {"error": str(e)}
+                print(f"\nERROR in ASKQ test round: {e}")
 
     if args.patch_test:
         try:
             pt = patch_syntax_test_round(client)
             output["patch_syntax_test"] = pt
         except Exception as e:
-            output["patch_syntax_test"] = {"error": str(e)}
-            print(f"\nERROR in PATCH test round: {e}")
+            if _keep_previous_result(e, previous, "patch_syntax_test"):
+                output["patch_syntax_test"] = previous["patch_syntax_test"]
+                print(f"\nERROR in PATCH test round (429): {e} -- keeping previous run's result")
+            else:
+                output["patch_syntax_test"] = {"error": str(e)}
+                print(f"\nERROR in PATCH test round: {e}")
 
     if args.gram_test:
         try:
             gt = constrained_decoding_test_round(client)
             output["gram_test"] = gt
         except Exception as e:
-            output["gram_test"] = {"error": str(e)}
-            print(f"\nERROR in GRAM test round: {e}")
+            if _keep_previous_result(e, previous, "gram_test"):
+                output["gram_test"] = previous["gram_test"]
+                print(f"\nERROR in GRAM test round (429): {e} -- keeping previous run's result")
+            else:
+                output["gram_test"] = {"error": str(e)}
+                print(f"\nERROR in GRAM test round: {e}")
 
     save()
 
