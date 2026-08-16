@@ -38,12 +38,19 @@ import sys
 from pathlib import Path
 from textwrap import indent
 
+import lark
 import openai
 
 # -- configuration ------------------------------------------------------------
 
 ENDPOINT = "https://openrouter.ai/api/v1"
 MODEL    = "qwen2.5-coder:7b"
+
+API_TYPE_LABELS = {
+    "openai-completions": "OpenAI Completions",
+    "openai-responses":   "OpenAI Responses",
+    "anthropic-messages": "Anthropic Messages",
+}
 
 _PROBE_DIR: Path | None = None
 
@@ -54,13 +61,47 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--model",    default=None, help="Model ID")
     p.add_argument("--key-name", default="OPENROUTER_API_KEY", dest="key_name",
                    help="Env-var name / keyring slot holding the API key (default: OPENROUTER_API_KEY).")
-    p.add_argument("--output",   default=None, help="Output JSON file (default: inferred_tool_schema_<model>.json)")
+    p.add_argument("--output",   default=None, help="Output JSON file (default: reports/<model>/capabilities_<model>.json)")
     p.add_argument("--quick-summary", action="store_true", dest="quick_summary",
-                   help="Read local inferred_tool_schema_*.json files and list models with native "
+                   help="Read reports/*/capabilities_*.json files and list models with native "
                         "structured tool_call support along with their main tool parameters.")
     p.add_argument("--quote-test", action="store_true", dest="quote_test",
                    help="Run an extra round that probes whether the model correctly escapes "
                         "double-quotes inside JSON argument values.")
+    p.add_argument("--efficiency-test", action="store_true", dest="efficiency_test",
+                   help="Run an extra round that probes whether the model prefers "
+                        "filtered/targeted calls (grep, sed -n, head, offset/limit reads) "
+                        "over pulling entire large files/outputs into context.")
+    p.add_argument("--askq-test", action="store_true", dest="askq_test",
+                   help="Run an extra round (8 phrasing variants, full schema, one "
+                        "sample each) that probes how strongly task wording drives "
+                        "the model to call its own ask_user_question tool.")
+    p.add_argument("--patch-test", action="store_true", dest="patch_test",
+                   help="Run an extra round (no tool schema) that probes whether "
+                        "the model naturally knows OpenAI's apply_patch envelope "
+                        "syntax, parsed against the real Lark grammar.")
+    p.add_argument("--gram-test", action="store_true", dest="gram_test",
+                   help="Run an extra round that sends a real OpenAI custom/freeform "
+                        "tool (type:'custom', format:{type:'grammar', syntax:'lark'}) "
+                        "and checks whether the endpoint honours it end to end, "
+                        "instead of falling back to classic function calling.")
+    p.add_argument("--api-type", default="openai-completions",
+                   choices=["openai-completions", "openai-responses", "anthropic-messages"],
+                   help="The *actual* backend transport behind the endpoint/script, for "
+                        "the report only -- probe_inference.py always speaks Chat "
+                        "Completions on the wire regardless of this flag. Set it when "
+                        "the target translates under the hood (e.g. a script that "
+                        "accepts Chat Completions JSON but forwards to a Responses API "
+                        "or Anthropic Messages backend). Default: openai-completions.")
+    p.add_argument("--script", default=None,
+                   help="Treat this local script as the inference server instead of "
+                        "hitting --endpoint over HTTP: it must read one OpenAI-style "
+                        "chat/completions JSON payload from stdin and print one JSON "
+                        "response to stdout (e.g. ~/bin/*-completions.py). --model is "
+                        "still used to label/log this run; --endpoint/--key-name are ignored.")
+    p.add_argument("--render-md", action="store_true", dest="render_md_only",
+                   help="Skip probing entirely; just (re)render the Markdown report "
+                        "from the existing capabilities_<model>.json (or --output) on disk.")
     return p.parse_args()
 
 
@@ -89,6 +130,49 @@ def make_client(api_key: str) -> openai.OpenAI:
         return openai.OpenAI(api_key="unused", base_url=ENDPOINT,
                              default_headers={"Authorization": ""})
     return openai.OpenAI(api_key=api_key, base_url=ENDPOINT)
+
+
+# -- local-script "inference server" adapter -----------------------------------
+#
+# Some models are only reachable through a local wrapper script rather than a
+# plain HTTP endpoint (auth handled internally, non-standard transport, etc.
+# see e.g. ~/bin/*-completions.py). Such a script reads one OpenAI-style
+# chat/completions JSON payload from stdin and prints one JSON response to
+# stdout. ScriptClient duck-types just enough of the openai.OpenAI client
+# (`.chat.completions.create(**kwargs)`) for chat() to treat that script as
+# the inference server, with no knowledge of what's inside it.
+
+class _ScriptChatCompletions:
+    def __init__(self, script_path: str):
+        self.script_path = script_path
+
+    def create(self, **kwargs) -> "openai.types.chat.ChatCompletion":
+        timeout = kwargs.pop("timeout", 300)
+        proc = subprocess.run(
+            [sys.executable, self.script_path],
+            input=json.dumps(kwargs),
+            capture_output=True, text=True, timeout=timeout,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(f"{self.script_path} exited {proc.returncode}: "
+                               f"{proc.stderr.strip()[:1000]}")
+        data = json.loads(proc.stdout)
+        # Some scripts return a near-OpenAI-compatible payload missing the
+        # bookkeeping fields (e.g. Copilot's API omits "object"/"created").
+        # Backfill rather than fail validation over fields nothing here reads.
+        data.setdefault("object", "chat.completion")
+        data.setdefault("created", 0)
+        return openai.types.chat.ChatCompletion.model_validate(data)
+
+
+class _ScriptChat:
+    def __init__(self, script_path: str):
+        self.completions = _ScriptChatCompletions(script_path)
+
+
+class ScriptClient:
+    def __init__(self, script_path: str):
+        self.chat = _ScriptChat(script_path)
 
 
 def _init_probe_dir(safe_model: str) -> None:
@@ -405,7 +489,17 @@ def args_to_schema_properties(args: dict) -> dict:
             typ = "array"
         else:
             typ = "string"
-        props[key] = {"type": typ, "description": key.replace("_", " ")}
+        prop: dict = {"type": typ, "description": key.replace("_", " ")}
+        # A bare-token string value (e.g. command="str_replace", no spaces or
+        # punctuation) is far more likely to be a mode/action selector than
+        # free-form content -- surface it as a single-value enum so the
+        # model isn't handed a required field with no hint of what's valid.
+        # Free-text fields (paths, file content, shell commands) contain
+        # spaces or punctuation and fall through unchanged.
+        if typ == "string" and isinstance(val, str) and re.fullmatch(r"[a-z][a-z0-9_]*", val):
+            prop["enum"] = [val]
+            prop["description"] = f"{prop['description']} (must be {val!r})"
+        props[key] = prop
     return props
 
 
@@ -719,7 +813,7 @@ def build_tool_dispatch(
     elicited: dict[str, dict],
     final_probes: dict[str, "ToolCallResult | None"],
     client: openai.OpenAI,
-) -> dict[str, dict]:
+) -> tuple[dict[str, dict], dict[str, str]]:
     """Build the tool_dispatch table stored in the probe JSON.
 
     For each tool observed in final_probes:
@@ -728,19 +822,28 @@ def build_tool_dispatch(
       - If no canonical op matches, ask the LLM to synthesise a Python function
         and store its source in generated_source.
 
-    Returned structure (keyed by model tool name):
+    Returns (dispatch, conflicts):
 
-      {
-        "str_replace_editor": {
-          "python_function": "t_update",
-          "param_map": {"path": "path", "old_str": "old", "new_str": "new"}
-        },
-        "some_unknown_tool": {
-          "python_function": "t_some_unknown_tool",
-          "param_map": {"x": "x"},
-          "generated_source": "def t_some_unknown_tool(x: str = '') -> tuple[str, dict]: ..."
+      dispatch (keyed by model tool name):
+        {
+          "str_replace_editor": {
+            "python_function": "t_update",
+            "param_map": {"path": "path", "old_str": "old", "new_str": "new"}
+          },
+          "some_unknown_tool": {
+            "python_function": "t_some_unknown_tool",
+            "param_map": {"x": "x"},
+            "generated_source": "def t_some_unknown_tool(x: str = '') -> tuple[str, dict]: ..."
+          }
         }
-      }
+
+      conflicts (keyed by op): the op's own probe call resolved to a tool
+      name some *other* op already claimed a dispatch entry for, e.g.
+        {"update_file": "read_file"}
+      means update_file's Round-2 probe call was actually `read_file(...)`
+      instead of its own elicited tool (e.g. str_replace_editor) -- so that
+      tool never gets a dispatch entry, not because the schema is broken,
+      but because the model substituted a different tool for this op.
     """
     section("Round 4 -- Building tool dispatch table")
 
@@ -752,6 +855,7 @@ def build_tool_dispatch(
     }
 
     dispatch: dict[str, dict] = {}
+    conflicts: dict[str, str] = {}
 
     for op, result in final_probes.items():
         if result is None:
@@ -762,7 +866,13 @@ def build_tool_dispatch(
         param_names = list(result.arguments.keys())
 
         if tool_name in dispatch:
-            # Two canonical ops share the same tool name -- already handled.
+            # This op's probe call resolved to a tool name another op
+            # already claimed a dispatch entry for -- record the collision
+            # instead of silently dropping it, so the report can explain
+            # *why* this op's own tool never got dispatched.
+            conflicts[op] = tool_name
+            print(f"  [{op}] probe call resolved to '{tool_name}', already claimed "
+                  f"by another op -- recorded as a conflict, not dispatched")
             continue
 
         canonical_op = _match_op(tool_name, param_names, elicited_names)
@@ -791,7 +901,7 @@ def build_tool_dispatch(
             }
             print(f"  [{tool_name}] -> {fn_name} (generated)")
 
-    return dispatch
+    return dispatch, conflicts
 
 
 # -- quick summary from local JSON files --------------------------------------
@@ -816,9 +926,9 @@ def _tool_param_signature(tool: dict) -> str:
 
 def quick_summary() -> None:
     import glob
-    paths = sorted(glob.glob("tool_schema_*.json"))
+    paths = sorted(glob.glob("reports/*/capabilities_*.json"))
     if not paths:
-        print("No schema json files found in the current directory.")
+        print("No schema json files found under reports/<model>/.")
         return
 
     structured_list: list[dict] = []
@@ -879,22 +989,33 @@ QUOTE_TEST_EXPECTED = {
 }
 
 
-def quote_test_round(client: openai.OpenAI, tools: list[dict]) -> dict:
+def quote_test_round(
+    client: openai.OpenAI, tools: list[dict], elicited_names: dict[str, str]
+) -> dict:
     section("Quote-escaping test -- arguments must contain literal double-quotes")
     print("\nEach task requires a double-quote character inside a JSON string value.")
     print("PASS = model emits valid JSON with the quote present in the parsed value.")
-    print("FAIL = JSON parse error, or the quote is silently dropped/mangled.\n")
+    print("FAIL = JSON parse error, or the quote is silently dropped/mangled.")
+    print("Only the tool relevant to each task is advertised (not the full schema), so")
+    print("this isolates quote-escaping fidelity from tool-selection behaviour -- a model")
+    print("that skips the intended tool for an unrelated one fails GREP/dispatch checks,")
+    print("not QUOTE. See CAPABILITIES.md.\n")
 
     results: dict[str, dict] = {}
     for op, task in QUOTE_TEST_TASKS.items():
+        tool_name  = elicited_names.get(op)
+        task_tools = [t for t in tools if (t.get("function") or t).get("name") == tool_name]
+        isolated   = bool(task_tools)
+        if not task_tools:
+            task_tools = tools  # fallback: no matching tool found, offer everything
         messages = [
             {"role": "system", "content": "You are a helpful assistant with tool access."},
             {"role": "user",   "content": task},
         ]
-        resp = chat(client, messages, tools=tools)
-        _save_probe(f"quote_test_{op}", messages, resp, tools=tools)
+        resp = chat(client, messages, tools=task_tools)
+        _save_probe(f"quote_test_{op}", messages, resp, tools=task_tools)
         entry: dict = {"task": task, "pass": False, "error": None,
-                       "structured": None, "parsed_args": None}
+                       "structured": None, "parsed_args": None, "isolated": isolated}
         result = extract_call_from_response(resp)
         if result is None:
             raw = resp.choices[0].message.content
@@ -924,59 +1045,867 @@ def quote_test_round(client: openai.OpenAI, tools: list[dict]) -> dict:
     return {"quote_test_results": results, "quote_test_passed": passed, "quote_test_total": total}
 
 
-# -- agent file generation ----------------------------------------------------
+# -- token-efficiency test ------------------------------------------------------
+#
+# Each task describes a large file/output where the token-cheap move is a
+# targeted, filtered call (grep, sed -n, head, wc -l, a dedicated search
+# tool, or a read with an offset/limit) instead of pulling the whole
+# file/output back into context. PASS = the model chose the cheap call.
 
-_AGENT_TEMPLATE = '''\
-#!/usr/bin/env python3
-"""Auto-generated wrapper -- runs agent_probe with model {model}.
+TOKEN_EFFICIENCY_TASKS = {
+    "large_log_grep": (
+        "The file /var/log/app.log is 500,000 lines long. Find all lines "
+        "containing the exact string 'FATAL ERROR' and show them to me."
+    ),
+    "count_occurrences": (
+        "The file /var/data/access.log has several million lines. Tell me "
+        "how many lines contain the IP address 203.0.113.42. I only need the count."
+    ),
+    "specific_line": (
+        "The file /opt/build/output.txt is over a million lines long. "
+        "What is on line 48213 of that file?"
+    ),
+    "check_string_exists": (
+        "The file /var/log/build.log is huge (hundreds of thousands of lines). "
+        "Does the word 'DeprecationWarning' appear anywhere in it? Just answer yes or no."
+    ),
+    "function_definition_search": (
+        "The file /repo/src/model.py is 20,000 lines long. Find the line "
+        "number where the function `def train_model` is defined."
+    ),
+    "process_output_filter": (
+        "List all currently running processes, but I only care about the "
+        "ones related to 'python'. Show me just those."
+    ),
+}
 
-Usage:
-    agent-{model} "<task>"           # one-shot
-    agent-{model}                    # interactive REPL
-    agent-{model} --non-interactive  # disable ask_user_question tool
+_EFFICIENT_BASH_MARKERS = ("grep", "awk", "sed -n", "sed '", 'sed "', "head ",
+                           "tail ", "wc -l", "wc -c", "cut ")
+_WASTEFUL_BASH_MARKERS  = ("cat ", "type ", "more ", "less ")
+
+
+def _classify_bash_command(command: str) -> tuple[bool, str]:
+    cmd = command.lower()
+    if any(m in cmd for m in _EFFICIENT_BASH_MARKERS):
+        return True, "command includes a filtering tool (grep/awk/sed/head/tail/wc/cut)"
+    if any(m in cmd for m in _WASTEFUL_BASH_MARKERS):
+        return False, "command dumps the file unfiltered (cat/more/less) instead of filtering"
+    return False, "command has no recognisable filtering -- likely reads everything"
+
+
+def _classify_read_args(args: dict) -> tuple[bool, str]:
+    partial_hints = ("offset", "limit", "start", "end", "line", "head", "max", "range")
+    if any(any(h in k.lower() for h in partial_hints) for k in args):
+        return True, "read call includes a range/offset/limit argument"
+    return False, "read call has no offset/limit -- requests the whole file"
+
+
+def token_efficiency_test_round(
+    client: openai.OpenAI, tools: list[dict], tool_dispatch: dict
+) -> dict:
+    section("Token-efficiency test -- prefer filtering over full dumps")
+    print("\nEach task involves a large file/output. PASS = model chooses a filtered/")
+    print("targeted call (grep, sed -n, head, a dedicated search tool, or a read with")
+    print("offset/limit). FAIL = model requests the entire file/output unfiltered.\n")
+
+    results: dict[str, dict] = {}
+    for op, task in TOKEN_EFFICIENCY_TASKS.items():
+        messages = [
+            {"role": "system", "content": "You are a helpful assistant with tool access. "
+                                           "Be mindful of token costs: avoid reading or "
+                                           "printing more data than necessary to answer "
+                                           "the question."},
+            {"role": "user", "content": task},
+        ]
+        resp = chat(client, messages, tools=tools)
+        _save_probe(f"token_efficiency_{op}", messages, resp, tools=tools)
+        entry: dict = {"task": task, "pass": False, "reason": None,
+                       "function_name": None, "python_function": None,
+                       "parsed_args": None}
+        result = extract_call_from_response(resp)
+        if result is None:
+            raw = resp.choices[0].message.content
+            entry["reason"] = "no tool call detected"
+            entry["raw_content"] = raw
+            print(f"[{op}] FAIL -- no call detected. content: {raw!r}")
+            results[op] = entry
+            continue
+
+        entry["function_name"] = result.function_name
+        entry["parsed_args"]   = result.arguments
+        dispatch_entry  = tool_dispatch.get(result.function_name) or {}
+        python_function = dispatch_entry.get("python_function")
+        entry["python_function"] = python_function
+
+        if python_function == "t_run":
+            passed, reason = _classify_bash_command(str(result.arguments.get("command", "")))
+        elif python_function == "t_search":
+            passed, reason = True, "dedicated search tool used -- inherently filtered"
+        elif python_function == "t_read":
+            passed, reason = _classify_read_args(result.arguments)
+        elif python_function in ("t_list_dir", "t_glob"):
+            passed, reason = True, f"{python_function} does not dump file contents"
+        else:
+            passed, reason = False, f"unrecognised python_function={python_function!r}"
+
+        entry["pass"]   = passed
+        entry["reason"] = reason
+        status = "PASS" if passed else "FAIL"
+        print(f"[{op}] {status} -- {result.function_name}({json.dumps(result.arguments)}) :: {reason}")
+        results[op] = entry
+
+    passed = sum(1 for r in results.values() if r["pass"])
+    total  = len(results)
+    print(f"\nToken-efficiency summary: {passed}/{total} passed")
+    return {"token_efficiency_results": results, "token_efficiency_passed": passed,
+            "token_efficiency_total": total}
+
+
+# -- ask_user_question phrasing test (ASKQ) -------------------------------------
+#
+# Explores how strongly a task's wording drives the model to actually invoke
+# its own ask_user_question tool, versus silently guessing or investigating
+# instead. All 8 variants run once each against the full tool schema (all
+# inferred tools available, matching real usage) -- no retries, so this
+# measures phrasing sensitivity, not sampling noise. A borderline phrasing
+# can still flip pass/fail run to run; see CAPABILITIES.md.
+
+_ASKQ_SYSTEM_DEFAULT = "You are a helpful assistant with tool access."
+_ASKQ_SYSTEM_NUDGE = (
+    "You are a helpful assistant with tool access. When a task requires user "
+    "input, preference, or confirmation before proceeding, you MUST call "
+    "ask_user_question rather than guessing, investigating, or acting unilaterally."
+)
+
+ASKQ_VARIANTS: dict[str, tuple[str, str]] = {
+    "original_probe": (
+        _ASKQ_SYSTEM_DEFAULT,
+        "Before you start, ask the user whether they want to overwrite "
+        "/tmp/test.txt or create a backup first."),
+    "imperative_must": (
+        _ASKQ_SYSTEM_DEFAULT,
+        "You must ask the user this exact question before doing anything else: "
+        "'Should I overwrite /tmp/test.txt or create a backup first?' Do not "
+        "perform any other action."),
+    "explicit_tool_name": (
+        _ASKQ_SYSTEM_DEFAULT,
+        "Call the ask_user_question tool now with the question: 'Overwrite "
+        "/tmp/test.txt or create a backup first?'"),
+    "first_person_unsure": (
+        _ASKQ_SYSTEM_DEFAULT,
+        "I'm not sure whether you want me to overwrite /tmp/test.txt or make "
+        "a backup first. Which do you prefer?"),
+    "ambiguous_no_ask_word": (
+        _ASKQ_SYSTEM_DEFAULT,
+        "There's ambiguity about whether /tmp/test.txt should be overwritten "
+        "or backed up before I proceed. Resolve it."),
+    "destructive_warning": (
+        _ASKQ_SYSTEM_DEFAULT,
+        "This action is destructive and irreversible. Before proceeding you "
+        "MUST get explicit user confirmation on whether to overwrite "
+        "/tmp/test.txt or back it up first. Ask now."),
+    "options_style": (
+        _ASKQ_SYSTEM_DEFAULT,
+        "Present the user with two options -- 'Overwrite /tmp/test.txt' or "
+        "'Create a backup first' -- and wait for their choice before doing "
+        "anything."),
+    "system_nudge": (
+        _ASKQ_SYSTEM_NUDGE,
+        "Before you start, ask the user whether they want to overwrite "
+        "/tmp/test.txt or create a backup first."),
+}
+
+
+def _likert_label(passed: int, total: int) -> str:
+    """Map a passed/total fraction to a 5-point Likert frequency label."""
+    if total == 0:
+        return "N/A"
+    ratio = passed / total
+    if ratio == 0:
+        return "Never"
+    if ratio <= 0.25:
+        return "Rarely"
+    if ratio <= 0.625:
+        return "Sometimes"
+    if ratio < 1.0:
+        return "Often"
+    return "Always"
+
+
+def ask_user_question_test_round(
+    client: openai.OpenAI, tools: list[dict], ask_tool_name: str | None
+) -> dict:
+    section("ASKQ test -- does phrasing drive the model to call ask_user_question?")
+    print("\nAll 8 variants run once each against the full tool schema (all inferred")
+    print("tools available). PASS = model calls its own ask_user_question tool.\n")
+
+    if not ask_tool_name:
+        print("No ask_user_question tool was elicited for this model -- skipping.")
+        return {"error": "no ask_user_question tool elicited"}
+
+    results: dict[str, dict] = {}
+    for variant, (system, task) in ASKQ_VARIANTS.items():
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": task},
+        ]
+        resp = chat(client, messages, tools=tools)
+        _save_probe(f"askq_{variant}", messages, resp, tools=tools)
+        entry: dict = {"task": task, "system": system, "pass": False,
+                       "function_name": None, "parsed_args": None}
+        result = extract_call_from_response(resp)
+        if result is None:
+            raw = resp.choices[0].message.content
+            entry["raw_content"] = raw
+            print(f"[{variant}] SKIPPED -- no tool call. content: {(raw or '')[:150]!r}")
+            results[variant] = entry
+            continue
+        entry["function_name"] = result.function_name
+        entry["parsed_args"]   = result.arguments
+        entry["pass"] = result.function_name == ask_tool_name
+        status = "ASKED" if entry["pass"] else "SKIPPED"
+        print(f"[{variant}] {status} -- {result.function_name}({json.dumps(result.arguments)})")
+        results[variant] = entry
+
+    passed = sum(1 for r in results.values() if r["pass"])
+    total  = len(results)
+    print(f"\nASKQ summary: {passed}/{total} ({_likert_label(passed, total)})")
+    return {"askq_results": results, "askq_passed": passed, "askq_total": total}
+
+
+# -- apply_patch syntax test (PATCH) --------------------------------------------
+#
+# Tests whether a model *naturally* knows OpenAI's apply_patch envelope
+# syntax (the format used by the real "custom"/freeform apply_patch tool --
+# see ~/bin/copilot-notes.md) from pretraining, independent of whether the
+# probing endpoint exposes that tool at all. No tool schema is offered; the
+# model is asked in free text to produce ONLY the raw patch, and the result
+# is parsed against the real grammar (adapted from openai/codex's
+# apply_patch.lark) rather than checked with a loose regex.
+#
+# The grammar below is restructured from the upstream Lark source: Python's
+# `lark` Earley engine rejects zero-width regex terminals (e.g. `/(.*)/ `),
+# which the upstream grammar uses for line content. Each terminal here folds
+# its trailing newline into the same regex so it can never match zero
+# characters, while accepting the exact same language.
+# Upstream: https://github.com/openai/codex/blob/main/codex-rs/core/src/tools/handlers/apply_patch.lark
+
+_APPLY_PATCH_LARK_GRAMMAR = r"""
+start: begin_patch hunk+ end_patch
+begin_patch: "*** Begin Patch" NL
+end_patch: "*** End Patch" NL?
+
+hunk: add_hunk | delete_hunk | update_hunk
+add_hunk: "*** Add File: " FILENAME NL add_line+
+delete_hunk: "*** Delete File: " FILENAME NL
+update_hunk: "*** Update File: " FILENAME NL change_move? change?
+
+FILENAME: /[^\n]+/
+add_line: ADD_LINE -> line
+ADD_LINE: /\+[^\n]*\n/
+
+change_move: "*** Move to: " FILENAME NL
+change: (change_context | change_line)+ eof_line?
+change_context: CONTEXT_LINE
+CONTEXT_LINE: /@@[^\n]*\n/
+change_line: CHANGE_LINE
+CHANGE_LINE: /[+\- ][^\n]*\n/
+eof_line: "*** End of File" NL
+
+NL: /\n/
 """
 
-import os, sys, importlib.util
-
-project_root = os.path.dirname(os.path.realpath(__file__))
-sys.path.insert(0, project_root)
-script_path = os.path.join(project_root, "agent_probe.py")
-
-spec = importlib.util.spec_from_file_location("agent_probe", script_path)
-agent_probe = importlib.util.module_from_spec(spec)
-spec.loader.exec_module(agent_probe)
-
-_k = os.environ.get({key_name_repr}, "")
-if _k:
-    os.environ["OPENROUTER_API_KEY"] = _k
-
-sys.argv.insert(1, {model_repr})
-sys.argv.insert(2, "--endpoint")
-sys.argv.insert(3, {endpoint_repr})
-agent_probe.main()
-'''
+_apply_patch_parser: lark.Lark | None = None
 
 
-def create_agent_file(model: str, safe_model: str, endpoint: str = "", key_name: str = "OPENROUTER_API_KEY") -> Path:
-    """Write agent-<safe_model>.py next to this script and symlink it into ~/bin."""
-    here       = Path(__file__).resolve().parent
-    agent_path = here / f"agent-{safe_model}.py"
-    agent_path.write_text(_AGENT_TEMPLATE.format(
-        model=model,
-        model_repr=repr(model),
-        endpoint_repr=repr(endpoint or ENDPOINT),
-        key_name_repr=repr(key_name),
-    ))
-    agent_path.chmod(0o755)
-    print(f"\nAgent file written: {agent_path}")
-    bin_dir   = Path.home() / "bin"
-    bin_dir.mkdir(parents=True, exist_ok=True)
-    link_path = bin_dir / f"agent-{safe_model}"
-    if link_path.is_symlink() or link_path.exists():
-        link_path.unlink()
-    link_path.symlink_to(agent_path)
-    print(f"Symlink created:    {link_path} -> {agent_path}")
-    return agent_path
+def _get_apply_patch_parser() -> lark.Lark:
+    global _apply_patch_parser
+    if _apply_patch_parser is None:
+        _apply_patch_parser = lark.Lark(
+            _APPLY_PATCH_LARK_GRAMMAR, start="start", parser="earley", lexer="dynamic_complete"
+        )
+    return _apply_patch_parser
+
+
+PATCH_TASKS = {
+    "update_file": (
+        "You need to edit the file /tmp/test.py: replace the exact string "
+        "'x = 1' with 'x = 42'. Express this change as a patch using the "
+        "exact format OpenAI's apply_patch tool expects (the same patch "
+        "envelope format used by Codex CLI). Respond with ONLY the raw "
+        "patch text -- no prose, no JSON, no markdown code fences."
+    ),
+    "add_file": (
+        "You need to create a new file /tmp/hello.txt containing exactly: "
+        "Hello, world! Express this as a patch using the exact format "
+        "OpenAI's apply_patch tool expects (the same patch envelope format "
+        "used by Codex CLI). Respond with ONLY the raw patch text -- no "
+        "prose, no JSON, no markdown code fences."
+    ),
+}
+
+
+def _strip_fences(text: str) -> str:
+    text = re.sub(r"^```(?:\w+)?\s*\n?", "", text.strip())
+    text = re.sub(r"\n?```\s*$", "", text)
+    return text.strip("\n") + "\n"
+
+
+def patch_syntax_test_round(client: openai.OpenAI) -> dict:
+    section("PATCH test -- does the model naturally know apply_patch syntax?")
+    print("\nNo tool schema is offered -- the model is asked in free text to produce")
+    print("ONLY a raw apply_patch-format patch, then it's parsed against the real")
+    print("grammar (not a loose regex). PASS = syntactically valid patch.\n")
+
+    parser  = _get_apply_patch_parser()
+    results: dict[str, dict] = {}
+    for op, task in PATCH_TASKS.items():
+        messages = [
+            {"role": "system", "content": "You are a helpful coding assistant."},
+            {"role": "user", "content": task},
+        ]
+        resp = chat(client, messages)
+        _save_probe(f"patch_syntax_{op}", messages, resp)
+        raw  = resp.choices[0].message.content or ""
+        text = _strip_fences(raw)
+        entry: dict = {"task": task, "pass": False, "error": None, "raw_content": raw}
+        try:
+            parser.parse(text)
+            entry["pass"] = True
+            print(f"[{op}] PASS\n{indent(text.strip(), '  ')}")
+        except lark.exceptions.LarkError as e:
+            entry["error"] = str(e)[:500]
+            print(f"[{op}] FAIL -- {entry['error'][:200]}")
+            print(f"  raw content: {raw[:300]!r}")
+        results[op] = entry
+
+    passed = sum(1 for r in results.values() if r["pass"])
+    total  = len(results)
+    print(f"\nPATCH summary: {passed}/{total} passed")
+    return {"patch_syntax_results": results, "patch_syntax_passed": passed,
+            "patch_syntax_total": total}
+
+
+# -- constrained-decoding / custom-tool test (GRAM) -----------------------------
+#
+# PATCH tests whether the model *knows* the apply_patch syntax from
+# pretraining, with no tool schema at all. This tests something different:
+# whether the *endpoint* actually implements OpenAI's real freeform/custom-tool
+# transport (`type: "custom"`, `format: {type: "grammar", syntax: "lark", ...}`)
+# end to end -- i.e. genuine grammar-constrained decoding, not classic
+# JSON-schema function calling with a tool that happens to be named
+# apply_patch. See CAPABILITIES.md and ~/bin/copilot-notes.md for the
+# background (confirmed directly: gpt-5-mini's endpoint 400s on this request
+# shape entirely; gpt-5.6-luna's Responses API returns a genuine
+# custom_tool_call once its wrapper script's translator is fixed to pass
+# `type: "custom"` tools through instead of silently dropping them).
+#
+# Sent verbatim as OpenAI/Codex define it -- unlike the PATCH grammar above,
+# this is not rewritten for Python-lark's zero-width-terminal restriction,
+# since it's the *endpoint's* grammar engine that has to accept it, not ours.
+# Source: https://github.com/openai/codex/blob/main/codex-rs/core/src/tools/handlers/apply_patch.lark
+
+_APPLY_PATCH_UPSTREAM_LARK_GRAMMAR = r"""
+start: begin_patch hunk+ end_patch
+begin_patch: "*** Begin Patch" LF
+end_patch: "*** End Patch" LF?
+
+hunk: add_hunk | delete_hunk | update_hunk
+add_hunk: "*** Add File: " filename LF add_line+
+delete_hunk: "*** Delete File: " filename LF
+update_hunk: "*** Update File: " filename LF change_move? change?
+
+filename: /(.+)/
+add_line: "+" /(.*)/ LF -> line
+
+change_move: "*** Move to: " filename LF
+change: (change_context | change_line)+ eof_line?
+change_context: ("@@" | "@@ " /(.+)/) LF
+change_line: ("+" | "-" | " ") /(.*)/ LF
+eof_line: "*** End of File" LF
+
+%import common.LF
+"""
+
+GRAM_TASKS = {
+    "apply_patch": {
+        "task": (
+            "In the file /tmp/test.py, replace the exact string 'x = 1' with "
+            "'x = 42'. Do not rewrite the whole file. Use the apply_patch tool."
+        ),
+        "name": "apply_patch",
+        "description": "Use the apply_patch tool to edit files, expressed as a V4A diff.",
+        "grammar": _APPLY_PATCH_UPSTREAM_LARK_GRAMMAR,
+        "local_validator": _get_apply_patch_parser,
+    },
+}
+
+
+def _build_custom_tool(name: str, description: str, grammar: str) -> dict:
+    return {
+        "type": "custom",
+        "custom": {
+            "name": name,
+            "description": description,
+            "format": {"type": "grammar", "grammar": {"syntax": "lark", "definition": grammar}},
+        },
+    }
+
+
+def constrained_decoding_test_round(client: openai.OpenAI) -> dict:
+    section("GRAM test -- does the endpoint support real constrained-decoding custom tools?")
+    print("\nSends a type:'custom' tool with format:{type:'grammar', syntax:'lark', ...} --")
+    print("the actual OpenAI freeform-tool transport, not classic JSON-schema function")
+    print("calling with a tool that happens to be named the same thing. PASS = a genuine")
+    print("'custom' tool_call comes back with grammar-valid input.\n")
+
+    results: dict[str, dict] = {}
+    for op, spec in GRAM_TASKS.items():
+        tool = _build_custom_tool(spec["name"], spec["description"], spec["grammar"])
+        messages = [
+            {"role": "system", "content": "You are a helpful coding assistant with tool access."},
+            {"role": "user", "content": spec["task"]},
+        ]
+        entry: dict = {"task": spec["task"], "pass": False, "error": None,
+                       "tool_call_type": None, "raw_input": None}
+        try:
+            resp = chat(client, messages, tools=[tool])
+        except Exception as e:
+            entry["error"] = f"request failed: {str(e)[:500]}"
+            print(f"[{op}] FAIL -- {entry['error']}")
+            results[op] = entry
+            continue
+
+        _save_probe(f"gram_{op}", messages, resp, tools=[tool])
+        msg        = resp.choices[0].message
+        tool_calls = getattr(msg, "tool_calls", None) or []
+        if not tool_calls:
+            entry["error"] = f"no tool call -- content: {(msg.content or '')[:200]!r}"
+            print(f"[{op}] FAIL -- {entry['error']}")
+            results[op] = entry
+            continue
+
+        tc      = tool_calls[0]
+        tc_type = getattr(tc, "type", None)
+        entry["tool_call_type"] = tc_type
+        if tc_type == "custom":
+            raw_input = tc.custom.input
+            entry["raw_input"] = raw_input
+            try:
+                spec["local_validator"]().parse(raw_input)
+                entry["pass"] = True
+                print(f"[{op}] PASS -- genuine custom_tool_call, grammar-valid input:\n"
+                     f"{indent(raw_input.strip(), '  ')}")
+            except lark.exceptions.LarkError as e:
+                entry["error"] = f"custom tool_call but grammar-invalid: {str(e)[:300]}"
+                print(f"[{op}] FAIL -- {entry['error']}")
+        else:
+            entry["error"] = (f"got tool_call type={tc_type!r} instead of 'custom' -- endpoint "
+                              "likely downgrades or silently rejects freeform tools")
+            print(f"[{op}] FAIL -- {entry['error']}")
+        results[op] = entry
+
+    passed = sum(1 for r in results.values() if r["pass"])
+    total  = len(results)
+    print(f"\nGRAM summary: {passed}/{total} passed")
+    return {"gram_results": results, "gram_passed": passed, "gram_total": total}
+
+
+# -- markdown report -----------------------------------------------------------
+
+def _md_escape(text: str) -> str:
+    return text.replace("|", "\\|").replace("\n", " ")
+
+
+def _capabilities_md_path(out_path: str) -> str:
+    """Derive the markdown report path from the JSON output path (same stem, .md)."""
+    return str(Path(out_path).with_suffix(".md"))
+
+
+def render_markdown_report(output: dict) -> str:
+    """Render the probe's JSON output dict as a human-readable Markdown report."""
+    lines: list[str] = []
+    model    = output.get("model", "?")
+    endpoint = output.get("endpoint", "?")
+    status   = output.get("status", "?")
+
+    lines.append(f"# Model capability probe: {model}")
+    lines.append("")
+    lines.append(f"- **Endpoint:** {endpoint}")
+    lines.append(f"- **API type:** {output.get('api_type', 'OpenAI Completions')}")
+    if status != "ok":
+        lines.append(f"- **Status:** {status}")
+    if output.get("error"):
+        lines.append(f"- **Error:** {output['error']}")
+    lines.append("")
+
+    fmt        = output.get("format_detection") or {}
+    behaviour  = output.get("behaviour") or {}
+    quote_test = output.get("quote_test")
+    tok_test   = output.get("token_efficiency_test")
+    askq_test  = output.get("askq_test")
+    patch_test = output.get("patch_syntax_test")
+    gram_test  = output.get("gram_test")
+
+    lines.append("## Capabilities summary")
+    lines.append("")
+    lines.append("See `CAPABILITIES.md` for what each codename measures, its unit, and its range.")
+    lines.append("")
+    lines.append("| Codename | Value |")
+    lines.append("|---|---|")
+    if behaviour:
+        structured = behaviour.get("structured_tool_calls", 0)
+        total_b    = structured + behaviour.get("inline_json_in_content", 0) + behaviour.get("no_call_detected", 0)
+        lines.append(f"| `TCALL` | {structured}/{total_b} |")
+    else:
+        lines.append("| `TCALL` | *(not run)* |")
+    if quote_test and "error" not in quote_test:
+        lines.append(f"| `QUOTE` | {quote_test.get('quote_test_passed', 0)}/{quote_test.get('quote_test_total', 0)} |")
+    else:
+        lines.append("| `QUOTE` | *(not run — pass `--quote-test`)* |")
+    if tok_test and "error" not in tok_test:
+        lines.append(f"| `GREP` | {tok_test.get('token_efficiency_passed', 0)}/{tok_test.get('token_efficiency_total', 0)} |")
+    else:
+        lines.append("| `GREP` | *(not run — pass `--efficiency-test`)* |")
+    if askq_test and "error" not in askq_test:
+        askq_passed = askq_test.get("askq_passed", 0)
+        askq_total  = askq_test.get("askq_total", 0)
+        lines.append(f"| `ASKQ` | {askq_passed}/{askq_total} ({_likert_label(askq_passed, askq_total)}) |")
+    else:
+        lines.append("| `ASKQ` | *(not run — pass `--askq-test`)* |")
+    if patch_test and "error" not in patch_test:
+        lines.append(f"| `PATCH` | {patch_test.get('patch_syntax_passed', 0)}/{patch_test.get('patch_syntax_total', 0)} |")
+    else:
+        lines.append("| `PATCH` | *(not run — pass `--patch-test`)* |")
+    if gram_test and "error" not in gram_test:
+        lines.append(f"| `GRAM` | {gram_test.get('gram_passed', 0)}/{gram_test.get('gram_total', 0)} |")
+    else:
+        lines.append("| `GRAM` | *(not run — pass `--gram-test`)* |")
+    dispatch_conflicts = output.get("dispatch_conflicts") or {}
+    elicited_names_all = output.get("elicited_names") or {}
+    tsel_total = sum(1 for fn in elicited_names_all.values() if fn)
+    if tsel_total:
+        tsel_passed = tsel_total - len(dispatch_conflicts)
+        lines.append(f"| `TSEL` | {tsel_passed}/{tsel_total} |")
+    else:
+        lines.append("| `TSEL` | *(not run)* |")
+    lines.append("")
+
+    lines.append("## Format detection & call delivery (`TCALL`)")
+    lines.append("")
+    if fmt.get("error"):
+        lines.append(f"Error: {fmt['error']}")
+        lines.append("")
+    else:
+        lines.append(f"- Round-0 probe (single call): detected format `{fmt.get('detected_format', '?')}`, "
+                     f"structured tool_calls used: {fmt.get('has_structured_tool_calls')}")
+        lines.append("")
+    if behaviour:
+        structured = behaviour.get("structured_tool_calls", 0)
+        inline     = behaviour.get("inline_json_in_content", 0)
+        missing    = behaviour.get("no_call_detected", 0)
+        total      = structured + inline + missing
+        lines.append(f"- Full probe ({total} tasks): call delivery mode `{behaviour.get('call_delivery_mode', '?')}`")
+        lines.append(f"  - Structured tool_calls: {structured}/{total} tasks")
+        lines.append(f"  - Inline JSON in content (model ignored the tools API and put "
+                     f"the call as JSON text in the message body instead): {inline}/{total} tasks")
+        lines.append(f"  - No call detected (neither a structured tool_call nor parseable inline JSON): "
+                     f"{missing}/{total} tasks")
+        if behaviour.get("note"):
+            lines.append(f"- Note: {behaviour['note']}")
+        lines.append("")
+
+    elicited = output.get("elicited_names") or {}
+    if elicited:
+        lines.append("## Elicited tool names")
+        lines.append("")
+        lines.append("Round 1 asks the model, in free text with no tool schema attached, what "
+                     "function/arguments it would use for each task. The prompt never names a "
+                     "tool — the model must invent the name itself.")
+        lines.append("")
+        lines.append("| Operation | Elicitation prompt | Model function name |")
+        lines.append("|---|---|---|")
+        for op, fn in elicited.items():
+            prompt = _md_escape(ELICIT_TASKS.get(op, ""))
+            lines.append(f"| {op} | {prompt} | {f'`{fn}`' if fn else '*(none)*'} |")
+        lines.append("")
+
+    tools = output.get("inferred_tool_schema") or []
+    if tools:
+        lines.append("## Inferred tool schema")
+        lines.append("")
+        for tool in tools:
+            fn = tool.get("function") or tool
+            name   = fn.get("name", "?")
+            desc   = fn.get("description", "")
+            params = fn.get("parameters") or {}
+            props  = params.get("properties") or {}
+            required = set(params.get("required") or [])
+            lines.append(f"### `{name}`")
+            if desc:
+                lines.append("")
+                lines.append(desc)
+            lines.append("")
+            if props:
+                lines.append("| Parameter | Type | Required |")
+                lines.append("|---|---|---|")
+                for pname, pinfo in props.items():
+                    ptype = pinfo.get("type", "?") if isinstance(pinfo, dict) else "?"
+                    lines.append(f"| {pname} | {ptype} | {'yes' if pname in required else 'no'} |")
+            lines.append("")
+
+    dispatch = output.get("tool_dispatch") or {}
+    if dispatch and "error" not in dispatch:
+        lines.append("## Tool dispatch table")
+        lines.append("")
+        lines.append("| Model tool name | Python function | Param map |")
+        lines.append("|---|---|---|")
+        for tool_name, entry in dispatch.items():
+            param_map = entry.get("param_map") or {}
+            param_str = ", ".join(f"{k}→{v}" for k, v in param_map.items()) or "*(none)*"
+            generated = " *(generated)*" if entry.get("generated_source") else ""
+            lines.append(f"| `{tool_name}` | `{entry.get('python_function', '?')}`{generated} | {param_str} |")
+        lines.append("")
+    elif dispatch.get("error"):
+        lines.append("## Tool dispatch table")
+        lines.append("")
+        lines.append(f"Error: {dispatch['error']}")
+        lines.append("")
+
+    if quote_test and "error" not in quote_test:
+        results = quote_test.get("quote_test_results") or {}
+        passed  = quote_test.get("quote_test_passed", 0)
+        total   = quote_test.get("quote_test_total", 0)
+        lines.append("## Quote-escaping test (`QUOTE`)")
+        lines.append("")
+        lines.append(f"**{passed}/{total} passed** — only the tool relevant to each task is "
+                     "advertised (not the full schema), so this isolates quote-escaping "
+                     "fidelity from tool-selection behaviour.")
+        lines.append("")
+        lines.append("| Operation | Isolated schema | Result | Function called | Notes |")
+        lines.append("|---|---|---|---|---|")
+        for op, r in results.items():
+            result = "PASS" if r.get("pass") else "FAIL"
+            fn     = r.get("function_name") or "*(none)*"
+            note   = _md_escape(r.get("error") or "")
+            isolated = "yes" if r.get("isolated") else "no *(fallback: full schema)*"
+            lines.append(f"| {op} | {isolated} | {result} | `{fn}` | {note} |")
+        lines.append("")
+    elif quote_test and quote_test.get("error"):
+        lines.append("## Quote-escaping test (`QUOTE`)")
+        lines.append("")
+        lines.append(f"Error: {quote_test['error']}")
+        lines.append("")
+
+    if tok_test and "error" not in tok_test:
+        results = tok_test.get("token_efficiency_results") or {}
+        passed  = tok_test.get("token_efficiency_passed", 0)
+        total   = tok_test.get("token_efficiency_total", 0)
+        lines.append("## Token-efficiency test (`GREP`)")
+        lines.append("")
+        lines.append(f"**{passed}/{total} passed** — prefers a filtered/targeted call over "
+                     "pulling the entire large file/output into context.")
+        lines.append("")
+        lines.append("| Operation | Result | Function called | Args | Reason |")
+        lines.append("|---|---|---|---|---|")
+        for op, r in results.items():
+            result = "PASS" if r.get("pass") else "FAIL"
+            fn     = r.get("function_name") or "*(none)*"
+            args   = _md_escape(json.dumps(r.get("parsed_args") or {}))
+            reason = _md_escape(r.get("reason") or "")
+            lines.append(f"| {op} | {result} | `{fn}` | {args} | {reason} |")
+        lines.append("")
+    elif tok_test and tok_test.get("error"):
+        lines.append("## Token-efficiency test (`GREP`)")
+        lines.append("")
+        lines.append(f"Error: {tok_test['error']}")
+        lines.append("")
+
+    if askq_test and "error" not in askq_test:
+        results = askq_test.get("askq_results") or {}
+        passed  = askq_test.get("askq_passed", 0)
+        total   = askq_test.get("askq_total", 0)
+        lines.append("## Ask-user-question phrasing test (`ASKQ`)")
+        lines.append("")
+        lines.append(f"**{passed}/{total} — {_likert_label(passed, total)}** calls its own "
+                     "ask_user_question tool across 8 phrasings of the same underlying task "
+                     "(full tool schema, one sample per phrasing, no retries).")
+        lines.append("")
+        lines.append("| Variant | System prompt | Result | Function called |")
+        lines.append("|---|---|---|---|")
+        for variant, r in results.items():
+            result = "ASKED" if r.get("pass") else "SKIPPED"
+            fn     = r.get("function_name") or "*(none)*"
+            sys_kind = "nudge" if r.get("system") != _ASKQ_SYSTEM_DEFAULT else "default"
+            lines.append(f"| {variant} | {sys_kind} | {result} | `{fn}` |")
+        lines.append("")
+    elif askq_test and askq_test.get("error"):
+        lines.append("## Ask-user-question phrasing test (`ASKQ`)")
+        lines.append("")
+        lines.append(f"Error: {askq_test['error']}")
+        lines.append("")
+
+    if patch_test and "error" not in patch_test:
+        results = patch_test.get("patch_syntax_results") or {}
+        passed  = patch_test.get("patch_syntax_passed", 0)
+        total   = patch_test.get("patch_syntax_total", 0)
+        lines.append("## apply_patch syntax test (`PATCH`)")
+        lines.append("")
+        lines.append(f"**{passed}/{total} passed** — no tool schema offered; the model is asked "
+                     "in free text to produce a raw apply_patch-format patch, parsed against the "
+                     "real grammar (not a loose regex). Tests whether the model *knows* the "
+                     "syntax, independent of whether the endpoint exposes the tool itself "
+                     "(see `~/bin/copilot-notes.md`).")
+        lines.append("")
+        lines.append("| Operation | Result | Notes |")
+        lines.append("|---|---|---|")
+        for op, r in results.items():
+            result = "PASS" if r.get("pass") else "FAIL"
+            note   = _md_escape(r.get("error") or "")
+            lines.append(f"| {op} | {result} | {note} |")
+        lines.append("")
+    elif patch_test and patch_test.get("error"):
+        lines.append("## apply_patch syntax test (`PATCH`)")
+        lines.append("")
+        lines.append(f"Error: {patch_test['error']}")
+        lines.append("")
+
+    if gram_test and "error" not in gram_test:
+        results = gram_test.get("gram_results") or {}
+        passed  = gram_test.get("gram_passed", 0)
+        total   = gram_test.get("gram_total", 0)
+        lines.append("## Constrained-decoding / custom-tool test (`GRAM`)")
+        lines.append("")
+        lines.append(f"**{passed}/{total} passed** — sends a real OpenAI `type:\"custom\"` "
+                     "freeform tool with `format:{type:\"grammar\", syntax:\"lark\"}`; PASS "
+                     "requires a genuine `custom` tool_call back with grammar-valid input "
+                     "(not a classic `function` tool_call, and not silently ignored). Tests the "
+                     "*endpoint's* transport support, independent of whether the model knows the "
+                     "syntax (`PATCH`) — see `~/bin/copilot-notes.md`.")
+        lines.append("")
+        lines.append("| Operation | Result | Tool call type | Notes |")
+        lines.append("|---|---|---|---|")
+        for op, r in results.items():
+            result = "PASS" if r.get("pass") else "FAIL"
+            tct    = r.get("tool_call_type") or "*(none)*"
+            note   = _md_escape(r.get("error") or "")
+            lines.append(f"| {op} | {result} | `{tct}` | {note} |")
+        lines.append("")
+    elif gram_test and gram_test.get("error"):
+        lines.append("## Constrained-decoding / custom-tool test (`GRAM`)")
+        lines.append("")
+        lines.append(f"Error: {gram_test['error']}")
+        lines.append("")
+
+    lines.append("## Missing capabilities")
+    lines.append("")
+    problems = _find_missing_capabilities(output)
+    if problems:
+        for p in problems:
+            lines.append(f"- {p}")
+    else:
+        lines.append("N/A")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+def _find_missing_capabilities(output: dict) -> list[str]:
+    """Collect problems/gaps found while probing, for the report's tail section."""
+    problems: list[str] = []
+
+    if output.get("error"):
+        problems.append(f"Probe aborted early: {output['error']}")
+
+    fmt = output.get("format_detection") or {}
+    if fmt.get("error"):
+        problems.append(f"`TCALL` format detection (round 0) failed: {fmt['error']}")
+
+    elicited = output.get("elicited_names") or {}
+    for op, fn in elicited.items():
+        if not fn:
+            problems.append(f"Could not elicit a function name for operation '{op}' "
+                            "(model's free-form answer was unparseable).")
+
+    dispatch  = output.get("tool_dispatch") or {}
+    conflicts = output.get("dispatch_conflicts") or {}
+    if dispatch.get("error"):
+        problems.append(f"Tool dispatch table build failed: {dispatch['error']}")
+    else:
+        schema_names    = {(t.get("function") or t).get("name") for t in output.get("inferred_tool_schema") or []}
+        dispatched_names = set(dispatch.keys())
+        elicited_names   = output.get("elicited_names") or {}
+        name_to_op       = {fn: op for op, fn in elicited_names.items() if fn}
+        for name in sorted(schema_names - dispatched_names):
+            owning_op   = name_to_op.get(name)
+            substituted = conflicts.get(owning_op) if owning_op else None
+            tag = f"TSEL_{owning_op}" if owning_op else f"TSEL_{name}"
+            if substituted:
+                problems.append(f"`{tag}` FAILED — op '{owning_op}' probe call resolved to "
+                                f"`{substituted}` instead of `{name}`.")
+            else:
+                problems.append(f"`{tag}` FAILED — tool `{name}` is in the inferred schema but "
+                                "was never dispatched (the model didn't call it with a matching "
+                                "signature during Round 2/3 probing).")
+
+    behaviour = output.get("behaviour") or {}
+    if behaviour.get("no_call_detected"):
+        problems.append(f"{behaviour['no_call_detected']} probe task(s) produced no detectable "
+                        "tool call at all (see probes/<model>/round2_*.json for which ones).")
+
+    quote_test = output.get("quote_test")
+    if quote_test is None:
+        problems.append("`QUOTE` capability not tested (rerun with --quote-test).")
+    elif quote_test.get("error"):
+        problems.append(f"`QUOTE` test failed to run: {quote_test['error']}")
+    else:
+        for op, r in (quote_test.get("quote_test_results") or {}).items():
+            if not r.get("pass"):
+                problems.append(f"`QUOTE_{op}` FAILED — {r.get('error', 'unknown reason')}")
+
+    tok_test = output.get("token_efficiency_test")
+    if tok_test is None:
+        problems.append("`GREP` capability not tested (rerun with --efficiency-test).")
+    elif tok_test.get("error"):
+        problems.append(f"`GREP` test failed to run: {tok_test['error']}")
+    else:
+        for op, r in (tok_test.get("token_efficiency_results") or {}).items():
+            if not r.get("pass"):
+                problems.append(f"`GREP_{op}` FAILED — {r.get('reason', 'unknown reason')}")
+
+    askq_test = output.get("askq_test")
+    if askq_test is None:
+        problems.append("`ASKQ` capability not tested (rerun with --askq-test).")
+    elif askq_test.get("error"):
+        problems.append(f"`ASKQ` test failed to run: {askq_test['error']}")
+    else:
+        for variant, r in (askq_test.get("askq_results") or {}).items():
+            if not r.get("pass"):
+                fn = r.get("function_name") or "no tool call"
+                problems.append(f"`ASKQ_{variant}` FAILED — called `{fn}` instead of "
+                                "asking the user.")
+
+    patch_test = output.get("patch_syntax_test")
+    if patch_test is None:
+        problems.append("`PATCH` capability not tested (rerun with --patch-test).")
+    elif patch_test.get("error"):
+        problems.append(f"`PATCH` test failed to run: {patch_test['error']}")
+    else:
+        for op, r in (patch_test.get("patch_syntax_results") or {}).items():
+            if not r.get("pass"):
+                problems.append(f"`PATCH_{op}` FAILED — {r.get('error', 'unknown reason')}")
+
+    gram_test = output.get("gram_test")
+    if gram_test is None:
+        problems.append("`GRAM` capability not tested (rerun with --gram-test).")
+    elif gram_test.get("error"):
+        problems.append(f"`GRAM` test failed to run: {gram_test['error']}")
+    else:
+        for op, r in (gram_test.get("gram_results") or {}).items():
+            if not r.get("pass"):
+                problems.append(f"`GRAM_{op}` FAILED — {r.get('error', 'unknown reason')}")
+
+    return problems
 
 
 # -- main ---------------------------------------------------------------------
@@ -988,18 +1917,35 @@ def main():
     if args.quick_summary:
         quick_summary()
         return
-    if args.endpoint:
+    if args.script:
+        ENDPOINT = f"script:{args.script}"
+    elif args.endpoint:
         ENDPOINT = args.endpoint
     if args.model:
         MODEL = args.model
 
     safe_model = MODEL.replace("/", "_").replace(":", "_")
-    out_path   = args.output or f"tool_schema_{safe_model}.json"
+    report_dir = Path("reports") / safe_model
+    report_dir.mkdir(parents=True, exist_ok=True)
+    out_path   = args.output or str(report_dir / f"capabilities_{safe_model}.json")
+
+    if args.render_md_only:
+        if not Path(out_path).exists():
+            sys.exit(f"Cannot render: {out_path} does not exist. Run the probe first.")
+        with open(out_path) as f:
+            output = json.load(f)
+        md_path = _capabilities_md_path(out_path)
+        with open(md_path, "w") as f:
+            f.write(render_markdown_report(output))
+        print(f"Rendered {md_path} from {out_path} (no probing performed)")
+        return
+
     _init_probe_dir(safe_model)
 
     output: dict = {
         "model":                MODEL,
         "endpoint":             ENDPOINT,
+        "api_type":             API_TYPE_LABELS[args.api_type],
         "status":               "incomplete",
         "error":                None,
         "format_detection":     {},
@@ -1007,19 +1953,31 @@ def main():
         "inferred_tool_schema": [],
         "behaviour":            {},
         "tool_dispatch":        {},
+        "dispatch_conflicts":   {},
         "quote_test":           None,
+        "token_efficiency_test": None,
+        "askq_test":            None,
+        "patch_syntax_test":    None,
+        "gram_test":            None,
     }
+
+    md_path = _capabilities_md_path(out_path)
 
     def save(note: str = ""):
         with open(out_path, "w") as f:
             json.dump(output, f, indent=2)
-        msg = f"\nReport written to {out_path}"
+        with open(md_path, "w") as f:
+            f.write(render_markdown_report(output))
+        msg = f"\nReport written to {out_path} and {md_path}"
         if note:
             msg += f"  ({note})"
         print(msg)
 
-    api_key = get_api_key(args.key_name)
-    client  = make_client(api_key)
+    if args.script:
+        client = ScriptClient(args.script)
+    else:
+        api_key = get_api_key(args.key_name)
+        client  = make_client(api_key)
 
     print(f"Target: {ENDPOINT}")
     print(f"Model:  {MODEL}")
@@ -1068,24 +2026,60 @@ def main():
     print(json.dumps(behaviour, indent=2))
 
     try:
-        tool_dispatch = build_tool_dispatch(elicited, final_probes, client)
+        tool_dispatch, dispatch_conflicts = build_tool_dispatch(elicited, final_probes, client)
         output["tool_dispatch"] = tool_dispatch
+        output["dispatch_conflicts"] = dispatch_conflicts
         section("Tool dispatch table")
         print(json.dumps(tool_dispatch, indent=2))
+        if dispatch_conflicts:
+            section("Dispatch conflicts")
+            print(json.dumps(dispatch_conflicts, indent=2))
     except Exception as e:
         output["tool_dispatch"] = {"error": str(e)}
         print(f"\nERROR building tool dispatch: {e}")
 
     if args.quote_test:
         try:
-            qt = quote_test_round(client, final_tools)
+            qt = quote_test_round(client, final_tools, output["elicited_names"])
             output["quote_test"] = qt
         except Exception as e:
             output["quote_test"] = {"error": str(e)}
             print(f"\nERROR in quote-test round: {e}")
 
+    if args.efficiency_test:
+        try:
+            et = token_efficiency_test_round(client, final_tools, output.get("tool_dispatch") or {})
+            output["token_efficiency_test"] = et
+        except Exception as e:
+            output["token_efficiency_test"] = {"error": str(e)}
+            print(f"\nERROR in token-efficiency test round: {e}")
+
+    if args.askq_test:
+        try:
+            ask_tool_name = (elicited.get("ask_user_question") or {}).get("function_name")
+            aq = ask_user_question_test_round(client, final_tools, ask_tool_name)
+            output["askq_test"] = aq
+        except Exception as e:
+            output["askq_test"] = {"error": str(e)}
+            print(f"\nERROR in ASKQ test round: {e}")
+
+    if args.patch_test:
+        try:
+            pt = patch_syntax_test_round(client)
+            output["patch_syntax_test"] = pt
+        except Exception as e:
+            output["patch_syntax_test"] = {"error": str(e)}
+            print(f"\nERROR in PATCH test round: {e}")
+
+    if args.gram_test:
+        try:
+            gt = constrained_decoding_test_round(client)
+            output["gram_test"] = gt
+        except Exception as e:
+            output["gram_test"] = {"error": str(e)}
+            print(f"\nERROR in GRAM test round: {e}")
+
     save()
-    create_agent_file(MODEL, safe_model, endpoint=ENDPOINT, key_name=args.key_name)
 
 
 if __name__ == "__main__":
