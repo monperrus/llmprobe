@@ -1,0 +1,309 @@
+{
+  "model": "gpt-5-mini",
+  "endpoint": "script:/home/martin/bin/copilot-gpt-5-mini-completions.py",
+  "status": "ok",
+  "error": null,
+  "format_detection": {
+    "detected_format": "structured_tool_calls",
+    "has_structured_tool_calls": true,
+    "raw_content_snippet": null
+  },
+  "elicited_names": {
+    "read_file": "read_file",
+    "write_file": "write_file",
+    "update_file": "apply_patch",
+    "execute_bash": "run_shell_command",
+    "ask_user_question": "ask_user_question",
+    "list_directory": "list_files",
+    "search_files": "search_files",
+    "glob": "find_files"
+  },
+  "inferred_tool_schema": [
+    {
+      "type": "function",
+      "function": {
+        "name": "read_file",
+        "description": "Perform the 'read_file' operation.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "path"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "write_file",
+        "description": "Perform the 'write_file' operation.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "path"
+            },
+            "content": {
+              "type": "string",
+              "description": "content"
+            },
+            "encoding": {
+              "type": "string",
+              "description": "encoding"
+            }
+          },
+          "required": [
+            "path",
+            "content",
+            "encoding"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "apply_patch",
+        "description": "Perform the 'update_file' operation.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "patch": {
+              "type": "string",
+              "description": "patch"
+            }
+          },
+          "required": [
+            "patch"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "run_shell_command",
+        "description": "Perform the 'execute_bash' operation.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "string",
+              "description": "command"
+            }
+          },
+          "required": [
+            "command"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "ask_user_question",
+        "description": "Perform the 'ask_user_question' operation.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "question": {
+              "type": "string",
+              "description": "question"
+            }
+          },
+          "required": [
+            "question"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "list_files",
+        "description": "Perform the 'list_directory' operation.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "path"
+            },
+            "recursive": {
+              "type": "boolean",
+              "description": "recursive"
+            }
+          },
+          "required": [
+            "path",
+            "recursive"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "search_files",
+        "description": "Perform the 'search_files' operation.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "directory": {
+              "type": "string",
+              "description": "directory"
+            },
+            "pattern": {
+              "type": "string",
+              "description": "pattern"
+            },
+            "recursive": {
+              "type": "boolean",
+              "description": "recursive"
+            },
+            "file_pattern": {
+              "type": "string",
+              "description": "file pattern"
+            },
+            "match_type": {
+              "type": "string",
+              "description": "match type (must be 'literal')",
+              "enum": [
+                "literal"
+              ]
+            },
+            "case_sensitive": {
+              "type": "boolean",
+              "description": "case sensitive"
+            }
+          },
+          "required": [
+            "directory",
+            "pattern",
+            "recursive",
+            "file_pattern",
+            "match_type",
+            "case_sensitive"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "find_files",
+        "description": "Perform the 'glob' operation.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "directory": {
+              "type": "string",
+              "description": "directory"
+            },
+            "pattern": {
+              "type": "string",
+              "description": "pattern"
+            },
+            "recursive": {
+              "type": "boolean",
+              "description": "recursive"
+            }
+          },
+          "required": [
+            "directory",
+            "pattern",
+            "recursive"
+          ]
+        }
+      }
+    }
+  ],
+  "behaviour": {
+    "call_delivery_mode": "mixed",
+    "structured_tool_calls": 7,
+    "inline_json_in_content": 0,
+    "no_call_detected": 1,
+    "note": "Model correctly uses the structured tool_calls API field."
+  },
+  "tool_dispatch": {
+    "read_file": {
+      "python_function": "t_read",
+      "param_map": {
+        "path": "path"
+      }
+    },
+    "write_file": {
+      "python_function": "t_write",
+      "param_map": {
+        "path": "path",
+        "content": "content"
+      }
+    },
+    "run_shell_command": {
+      "python_function": "t_run",
+      "param_map": {
+        "command": "command"
+      }
+    },
+    "list_files": {
+      "python_function": "t_list_dir",
+      "param_map": {
+        "path": "path"
+      }
+    },
+    "search_files": {
+      "python_function": "t_search",
+      "param_map": {
+        "directory": "path",
+        "file_pattern": "pattern",
+        "pattern": "pattern"
+      }
+    },
+    "find_files": {
+      "python_function": "t_glob",
+      "param_map": {}
+    }
+  },
+  "dispatch_conflicts": {
+    "update_file": "read_file"
+  },
+  "quote_test": null,
+  "token_efficiency_test": null,
+  "askq_test": null,
+  "patch_syntax_test": null,
+  "gram_test": {
+    "gram_results": {
+      "apply_patch": {
+        "task": "In the file /tmp/test.py, replace the exact string 'x = 1' with 'x = 42'. Do not rewrite the whole file. Use the apply_patch tool.",
+        "pass": false,
+        "error": "request failed: /home/martin/bin/copilot-gpt-5-mini-completions.py exited 1: Traceback (most recent call last):\n  File \"/home/martin/bin/copilot-gpt-5-mini-completions.py\", line 101, in <module>\n    main()\n    ~~~~^^\n  File \"/home/martin/bin/copilot-gpt-5-mini-completions.py\", line 96, in main\n    resp.raise_for_status()\n    ~~~~~~~~~~~~~~~~~~~~~^^\n  File \"/home/martin/.local/lib/python3.13/site-packages/requests/models.py\", line 1167, in raise_for_status\n    raise HTTPError(http_error_msg, response=self)\nreque",
+        "tool_call_type": null,
+        "raw_input": null
+      }
+    },
+    "gram_passed": 0,
+    "gram_total": 1
+  },
+  "api_type": "OpenAI Completions",
+  "rjson_test": {
+    "rjson_results": {
+      "json_schema": {
+        "pass": true,
+        "supported": true,
+        "schema_conformant": true,
+        "error": null,
+        "parsed_value": "hello",
+        "raw_content": "{\"value\":\"hello\"}"
+      }
+    },
+    "rjson_passed": 1,
+    "rjson_total": 1
+  }
+}

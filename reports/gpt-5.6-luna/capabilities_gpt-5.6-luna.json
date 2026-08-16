@@ -1,0 +1,286 @@
+{
+  "model": "gpt-5.6-luna",
+  "endpoint": "script:/home/martin/bin/copilot-gpt-5.6-luna.py",
+  "status": "ok",
+  "error": null,
+  "format_detection": {
+    "detected_format": "structured_tool_calls",
+    "has_structured_tool_calls": true,
+    "raw_content_snippet": null
+  },
+  "elicited_names": {
+    "read_file": "read_file",
+    "write_file": "write_file",
+    "update_file": "replace_in_file",
+    "execute_bash": "shell",
+    "ask_user_question": "ask_user_question",
+    "list_directory": "list_directory",
+    "search_files": "grep",
+    "glob": "glob"
+  },
+  "inferred_tool_schema": [
+    {
+      "type": "function",
+      "function": {
+        "name": "read_file",
+        "description": "Perform the 'read_file' operation.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "path"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "write_file",
+        "description": "Perform the 'write_file' operation.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "path"
+            },
+            "content": {
+              "type": "string",
+              "description": "content"
+            }
+          },
+          "required": [
+            "path",
+            "content"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "replace_in_file",
+        "description": "Perform the 'update_file' operation.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "path"
+            },
+            "old_string": {
+              "type": "string",
+              "description": "old string"
+            },
+            "new_string": {
+              "type": "string",
+              "description": "new string"
+            }
+          },
+          "required": [
+            "path",
+            "old_string",
+            "new_string"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "shell",
+        "description": "Perform the 'execute_bash' operation.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "command": {
+              "type": "string",
+              "description": "command"
+            }
+          },
+          "required": [
+            "command"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "ask_user_question",
+        "description": "Perform the 'ask_user_question' operation.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "question": {
+              "type": "string",
+              "description": "question"
+            }
+          },
+          "required": [
+            "question"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "list_directory",
+        "description": "Perform the 'list_directory' operation.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "path": {
+              "type": "string",
+              "description": "path"
+            }
+          },
+          "required": [
+            "path"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "grep",
+        "description": "Perform the 'search_files' operation.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "pattern": {
+              "type": "string",
+              "description": "pattern"
+            },
+            "path": {
+              "type": "string",
+              "description": "path"
+            },
+            "recursive": {
+              "type": "boolean",
+              "description": "recursive"
+            }
+          },
+          "required": [
+            "pattern",
+            "path",
+            "recursive"
+          ]
+        }
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "glob",
+        "description": "Perform the 'glob' operation.",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "pattern": {
+              "type": "string",
+              "description": "pattern"
+            },
+            "recursive": {
+              "type": "boolean",
+              "description": "recursive"
+            }
+          },
+          "required": [
+            "pattern",
+            "recursive"
+          ]
+        }
+      }
+    }
+  ],
+  "behaviour": {
+    "call_delivery_mode": "mixed",
+    "structured_tool_calls": 7,
+    "inline_json_in_content": 0,
+    "no_call_detected": 1,
+    "note": "Model correctly uses the structured tool_calls API field."
+  },
+  "tool_dispatch": {
+    "read_file": {
+      "python_function": "t_read",
+      "param_map": {
+        "path": "path"
+      }
+    },
+    "write_file": {
+      "python_function": "t_write",
+      "param_map": {
+        "path": "path",
+        "content": "content"
+      }
+    },
+    "replace_in_file": {
+      "python_function": "t_update",
+      "param_map": {
+        "path": "path",
+        "old_string": "old",
+        "new_string": "new"
+      }
+    },
+    "shell": {
+      "python_function": "t_run",
+      "param_map": {
+        "command": "command"
+      }
+    },
+    "list_directory": {
+      "python_function": "t_list_dir",
+      "param_map": {
+        "path": "path"
+      }
+    },
+    "glob": {
+      "python_function": "t_glob",
+      "param_map": {}
+    }
+  },
+  "dispatch_conflicts": {
+    "search_files": "shell"
+  },
+  "quote_test": null,
+  "token_efficiency_test": null,
+  "askq_test": null,
+  "patch_syntax_test": null,
+  "gram_test": {
+    "gram_results": {
+      "apply_patch": {
+        "task": "In the file /tmp/test.py, replace the exact string 'x = 1' with 'x = 42'. Do not rewrite the whole file. Use the apply_patch tool.",
+        "pass": true,
+        "error": null,
+        "tool_call_type": "custom",
+        "raw_input": "*** Begin Patch\n*** Update File: /tmp/test.py\n@@\n-x = 1\n+x = 42\n*** End Patch\n"
+      }
+    },
+    "gram_passed": 1,
+    "gram_total": 1
+  },
+  "api_type": "OpenAI Responses",
+  "rjson_test": {
+    "rjson_results": {
+      "json_schema": {
+        "pass": false,
+        "supported": true,
+        "schema_conformant": false,
+        "error": null,
+        "parsed_value": null,
+        "raw_content": "hello"
+      }
+    },
+    "rjson_passed": 0,
+    "rjson_total": 1
+  }
+}
