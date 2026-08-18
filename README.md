@@ -19,7 +19,7 @@ so different models and endpoints can be compared side by side.
 | `RJSON` | Endpoint honours strict `response_format:{type:"json_schema"}` |
 | `STRM` | Endpoint delivers real incremental SSE chunks under `stream:true` |
 | `REASN` | Reasoning tokens exposed, and whether reasoning-effort syntax is accepted |
-| `TSEL` | Model calls the tool it itself proposed, without a naming conflict |
+| `TSEL` | Model calls the right tool in a list |
 
 Full definitions, units, and ranges: [CAPABILITIES.md](CAPABILITIES.md).
 

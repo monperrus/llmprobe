@@ -723,6 +723,43 @@ def behavioural_summary(probe_calls: dict[str, ToolCallResult | None]) -> dict:
     }
 
 
+def tool_selection_test(
+    probe_calls: dict[str, ToolCallResult | None], elicited_names: dict[str, str]
+) -> dict:
+    """Score whether each full-schema probe call selected its expected tool.
+
+    This deliberately measures selection, not whether a model repeats a name it
+    invented during elicitation: every Round-2 task sees the complete inferred
+    tool list, and its result is compared to the tool assigned to that task.
+    """
+    results: dict[str, dict] = {}
+    for op, expected_name in elicited_names.items():
+        if not expected_name:
+            continue  # No distinct tool was available for this operation.
+        call = probe_calls.get(op)
+        called_name = call.function_name if call else None
+        passed = called_name == expected_name
+        if call is None:
+            error = "no tool call detected"
+        elif not passed:
+            error = f"called {called_name!r} instead of {expected_name!r}"
+        else:
+            error = None
+        results[op] = {
+            "pass": passed,
+            "expected_function_name": expected_name,
+            "function_name": called_name,
+            "error": error,
+        }
+
+    passed = sum(1 for result in results.values() if result["pass"])
+    return {
+        "tsel_results": results,
+        "tsel_passed": passed,
+        "tsel_total": len(results),
+    }
+
+
 # -- tool dispatch table -------------------------------------------------------
 #
 # _CANONICAL_OPS maps each canonical operation name to:
@@ -1942,11 +1979,10 @@ def render_markdown_report(output: dict) -> str:
         lines.append(f"| `REASN` | {reasoning_test.get('reason_passed', 0)}/{reasoning_test.get('reason_total', 0)} |")
     else:
         lines.append("| `REASN` | *(not run — rerun without `--no-reasoning-test`)* |")
-    dispatch_conflicts = output.get("dispatch_conflicts") or {}
-    elicited_names_all = output.get("elicited_names") or {}
-    tsel_total = sum(1 for fn in elicited_names_all.values() if fn)
-    if tsel_total:
-        tsel_passed = tsel_total - len(dispatch_conflicts)
+    tsel_test = output.get("tsel_test")
+    if tsel_test and "error" not in tsel_test:
+        tsel_passed = tsel_test.get("tsel_passed", 0)
+        tsel_total = tsel_test.get("tsel_total", 0)
         lines.append(f"| `TSEL` | {tsel_passed}/{tsel_total} |")
     else:
         lines.append("| `TSEL` | *(not run)* |")
@@ -2014,6 +2050,23 @@ def render_markdown_report(output: dict) -> str:
                     ptype = pinfo.get("type", "?") if isinstance(pinfo, dict) else "?"
                     lines.append(f"| {pname} | {ptype} | {'yes' if pname in required else 'no'} |")
             lines.append("")
+
+    if tsel_test and "error" not in tsel_test:
+        results = tsel_test.get("tsel_results") or {}
+        lines.append("## Tool-selection test (`TSEL`)")
+        lines.append("")
+        lines.append("Each task is run with the full inferred tool schema. PASS means the "
+                     "model called the tool assigned to that operation.")
+        lines.append("")
+        lines.append("| Operation | Result | Expected tool | Called tool | Notes |")
+        lines.append("|---|---|---|---|---|")
+        for op, result in results.items():
+            status = "PASS" if result.get("pass") else "FAIL"
+            expected = result.get("expected_function_name") or "*(none)*"
+            called = result.get("function_name") or "*(none)*"
+            note = _md_escape(result.get("error") or "")
+            lines.append(f"| {op} | {status} | `{expected}` | `{called}` | {note} |")
+        lines.append("")
 
     dispatch = output.get("tool_dispatch") or {}
     if dispatch and "error" not in dispatch:
@@ -2272,26 +2325,21 @@ def _find_missing_capabilities(output: dict) -> list[str]:
             problems.append(f"Could not elicit a function name for operation '{op}' "
                             "(model's free-form answer was unparseable).")
 
+    tsel_test = output.get("tsel_test") or {}
+    for op, result in (tsel_test.get("tsel_results") or {}).items():
+        if not result.get("pass"):
+            problems.append(f"`TSEL_{op}` FAILED — {result.get('error', 'wrong tool selected')}.")
+
     dispatch  = output.get("tool_dispatch") or {}
-    conflicts = output.get("dispatch_conflicts") or {}
     if dispatch.get("error"):
         problems.append(f"Tool dispatch table build failed: {dispatch['error']}")
     else:
         schema_names    = {(t.get("function") or t).get("name") for t in output.get("inferred_tool_schema") or []}
         dispatched_names = set(dispatch.keys())
         elicited_names   = output.get("elicited_names") or {}
-        name_to_op       = {fn: op for op, fn in elicited_names.items() if fn}
         for name in sorted(schema_names - dispatched_names):
-            owning_op   = name_to_op.get(name)
-            substituted = conflicts.get(owning_op) if owning_op else None
-            tag = f"TSEL_{owning_op}" if owning_op else f"TSEL_{name}"
-            if substituted:
-                problems.append(f"`{tag}` FAILED — op '{owning_op}' probe call resolved to "
-                                f"`{substituted}` instead of `{name}`.")
-            else:
-                problems.append(f"`{tag}` FAILED — tool `{name}` is in the inferred schema but "
-                                "was never dispatched (the model didn't call it with a matching "
-                                "signature during Round 2/3 probing).")
+            problems.append(f"Tool `{name}` is in the inferred schema but was never dispatched "
+                            "(the model didn't call it with a matching signature during Round 2/3 probing).")
 
     behaviour = output.get("behaviour") or {}
     if behaviour.get("no_call_detected"):
@@ -2430,6 +2478,7 @@ def main():
         "behaviour":            {},
         "tool_dispatch":        {},
         "dispatch_conflicts":   {},
+        "tsel_test":            None,
         "quote_test":           None,
         "token_efficiency_test": None,
         "askq_test":            None,
@@ -2513,6 +2562,7 @@ def main():
     output["status"]               = "ok"
     output["inferred_tool_schema"] = final_tools
     output["behaviour"]            = behaviour
+    output["tsel_test"]            = tool_selection_test(final_probes, output["elicited_names"])
 
     section("Final inferred tool schema")
     print(json.dumps(final_tools, indent=2))

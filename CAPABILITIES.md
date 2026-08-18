@@ -56,16 +56,15 @@ against the full tool schema.
 
 ## `TSEL`
 
-**Capability:** Model calls the tool it itself proposed for an operation
-during Round 1 elicitation, rather than substituting a different tool
-already claimed by another op, when probed against the full competing
-schema in Round 2. Derived from `tool_dispatch`/`dispatch_conflicts`, not a
-separate probe round — it's always computed whenever the main probe runs.
+**Capability:** Model selects the right tool from the full competing schema
+for each operation in Round 2. A pass requires the call's tool name to match
+the tool assigned to that operation in the offered schema; calling a different
+listed tool, or making no tool call, fails. This is derived from the Round-2
+probe calls, not a separate probe round.
 
-- **Unit:** ops without a conflict / ops with an elicited tool name
+- **Unit:** correct tool selections / operations with an offered tool
 - **Range:** 0 to 8 ops
-- **Source:** `dispatch_conflicts` (built inside `build_tool_dispatch()`,
-  always populated as part of the main probe — no flag needed)
+- **Source:** `tsel_test` (built from `probe_round()` results; no flag needed)
 
 ## `GRAMK`
 
@@ -140,10 +139,10 @@ tokens:
 
 ## `TSEL`
 
-**Capability:** Model calls the tool it itself proposed for an operation
-during Round 1 elicitation, rather than substituting a different tool
-when both are available in the offered schema. See `dispatch_conflicts`
-in the report for which tool the model substituted instead.
+**Capability:** Model calls the right tool when several tools are available.
+Each Round-2 task is run against the full inferred schema; the call must match
+the tool assigned to that task's operation. See `tsel_test` in the report for
+the expected and actual tool names.
 
 ## GRAMT detail
 
@@ -186,11 +185,9 @@ dropping them. See `~/bin/copilot-notes.md` for the full writeup.
   to skip it, in which case its JSON field is `null` and the markdown
   report omits the section. `TSEL` has no flag — it's always available
   once the main probe runs.
-- `TSEL` failures are what used to show up as a bare, uncoded "Tool X was
-  never dispatched" line in "Missing capabilities". They're now tagged
-  `TSEL_<op>` for consistency with `QUOTE_<op>`, `GREP_<op>`, and
-  `ASKQ_<variant>` — every per-item failure line names the capability
-  family it belongs to.
+- `TSEL` is scored directly from the full-schema Round-2 calls. Its per-item
+  failures are tagged `TSEL_<op>`, consistently with `QUOTE_<op>`,
+  `GREP_<op>`, and `ASKQ_<variant>`.
 - A `FAIL` on `GREP` does not mean the model got the *answer* wrong — the
   probe never executes the tool call, so correctness of results is out of
   scope. It only measures whether the model *chose* a token-cheap call
