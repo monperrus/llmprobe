@@ -10,12 +10,14 @@ See `CAPABILITIES.md` for what each codename measures, its unit, and its range.
 | Codename | Value |
 |---|---|
 | `TCALL` | 7/8 |
-| `QUOTE` | *(not run — pass `--quote-test`)* |
-| `GREP` | *(not run — pass `--efficiency-test`)* |
-| `ASKQ` | *(not run — pass `--askq-test`)* |
-| `PATCH` | *(not run — pass `--patch-test`)* |
-| `GRAM` | 0/1 |
+| `QUOTE` | *(not run — rerun without `--no-quote-test`)* |
+| `GREP` | *(not run — rerun without `--no-efficiency-test`)* |
+| `ASKQ` | *(not run — rerun without `--no-askq-test`)* |
+| `GRAMK` | *(not run — rerun without `--no-gram-knowledge-test`)* |
+| `GRAMT` | 0/1 |
 | `RJSON` | 1/1 |
+| `STRM` | *(not run — rerun without `--no-stream-test`)* |
+| `REASN` | *(not run — rerun without `--no-reasoning-test`)* |
 | `TSEL` | 7/8 |
 
 ## Format detection & call delivery (`TCALL`)
@@ -130,9 +132,9 @@ Perform the 'glob' operation.
 | `search_files` | `t_search` | directory→path, file_pattern→pattern, pattern→pattern |
 | `find_files` | `t_glob` | *(none)* |
 
-## Constrained-decoding / custom-tool test (`GRAM`)
+## Constrained-decoding / custom-tool test (`GRAMT`)
 
-**0/1 passed** — sends a real OpenAI `type:"custom"` freeform tool with `format:{type:"grammar", syntax:"lark"}`; PASS requires a genuine `custom` tool_call back with grammar-valid input (not a classic `function` tool_call, and not silently ignored). Tests the *endpoint's* transport support, independent of whether the model knows the syntax (`PATCH`) — see `~/bin/copilot-notes.md`.
+**0/1 passed** — sends a real OpenAI `type:"custom"` freeform tool with `format:{type:"grammar", syntax:"lark"}`; PASS requires a genuine `custom` tool_call back with grammar-valid input (not a classic `function` tool_call, and not silently ignored). Tests the *endpoint's* transport support, independent of whether the model knows the syntax (`GRAMK`) — see `~/bin/copilot-notes.md`.
 
 | Operation | Result | Tool call type | Notes |
 |---|---|---|---|
@@ -151,11 +153,11 @@ Perform the 'glob' operation.
 - `TSEL_update_file` FAILED — op 'update_file' probe call resolved to `read_file` instead of `apply_patch`.
 - `TSEL_ask_user_question` FAILED — tool `ask_user_question` is in the inferred schema but was never dispatched (the model didn't call it with a matching signature during Round 2/3 probing).
 - 1 probe task(s) produced no detectable tool call at all (see probes/<model>/round2_*.json for which ones).
-- `QUOTE` capability not tested (rerun with --quote-test).
-- `GREP` capability not tested (rerun with --efficiency-test).
-- `ASKQ` capability not tested (rerun with --askq-test).
-- `PATCH` capability not tested (rerun with --patch-test).
-- `GRAM_apply_patch` FAILED — request failed: /home/martin/bin/copilot-gpt-5-mini-completions.py exited 1: Traceback (most recent call last):
+- `QUOTE` capability not tested (rerun without --no-quote-test).
+- `GREP` capability not tested (rerun without --no-efficiency-test).
+- `ASKQ` capability not tested (rerun without --no-askq-test).
+- `GRAMK` capability not tested (rerun without --no-gram-knowledge-test).
+- `GRAMT_apply_patch` FAILED — request failed: /home/martin/bin/copilot-gpt-5-mini-completions.py exited 1: Traceback (most recent call last):
   File "/home/martin/bin/copilot-gpt-5-mini-completions.py", line 101, in <module>
     main()
     ~~~~^^
@@ -165,3 +167,5 @@ Perform the 'glob' operation.
   File "/home/martin/.local/lib/python3.13/site-packages/requests/models.py", line 1167, in raise_for_status
     raise HTTPError(http_error_msg, response=self)
 reque
+- `STRM` capability not tested (rerun without --no-stream-test).
+- `REASN` capability not tested (rerun without --no-reasoning-test).

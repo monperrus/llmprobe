@@ -67,21 +67,21 @@ separate probe round — it's always computed whenever the main probe runs.
 - **Source:** `dispatch_conflicts` (built inside `build_tool_dispatch()`,
   always populated as part of the main probe — no flag needed)
 
-## `PATCH`
+## `GRAMK`
 
-**Capability:** Model naturally knows OpenAI's `apply_patch` envelope syntax
+**Capability:** Model naturally knows OpenAI's `apply_patch` envelope grammar
 from pretraining alone — no tool schema is offered, no
 example is shown. The model is asked in free text to produce only the raw
 patch, and the result is parsed against the real grammar (not a loose
-regex), so this measures syntax knowledge specifically, decoupled from
+regex), so this measures grammar knowledge specifically, decoupled from
 whether the probing endpoint actually exposes the freeform `apply_patch`
 tool.
 
 - **Unit:** tasks passed / tasks run
 - **Range:** 0 to 2 tasks
-- **Source:** `patch_syntax_test` (enabled with `--patch-test`)
+- **Source:** `gram_knowledge_test` (enabled by default; disable with `--no-gram-knowledge-test`)
 
-## `GRAM`
+## `GRAMT`
 
 **Capability:** Endpoint honours a genuine OpenAI custom/freeform tool
 (`type:"custom"`, `format:{type:"grammar", syntax:"lark", ...}`) end to end —
@@ -90,18 +90,53 @@ endpoint falling back to classic function calling or rejecting the request.
 
 - **Unit:** tasks passed / tasks run
 - **Range:** 0 to 1 task
-- **Source:** `gram_test` (enabled with `--gram-test`)
+- **Source:** `gram_transport_test` (enabled by default; disable with `--no-gram-transport-test`)
 
 ## `RJSON`
 
 **Capability:** Endpoint honours strict structured output — a
 `response_format:{type:"json_schema"}` request (no tool schema) is accepted
 and the reply content parses as JSON conforming to the given schema. Like
-`GRAM`, this is an endpoint/provider feature, not a model behaviour.
+`GRAMT`, this is an endpoint/provider feature, not a model behaviour.
 
 - **Unit:** tasks passed / tasks run
 - **Range:** 0 to 1 task
-- **Source:** `rjson_test` (enabled with `--rjson-test`)
+- **Source:** `rjson_test` (enabled by default; disable with `--no-rjson-test`)
+
+## `STRM`
+
+**Capability:** Endpoint delivers a `stream:true` response as real
+incremental Server-Sent Events rather than rejecting the parameter or
+accepting it but buffering the whole reply into a single chunk. PASS
+requires more than one `ChatCompletionChunk`, non-empty content
+reconstructed from `delta.content` across chunks, and a chunk carrying
+`finish_reason`. An endpoint/provider feature, not a model behaviour.
+
+- **Unit:** tasks passed / tasks run
+- **Range:** 0 to 1 task
+- **Source:** `stream_test` (enabled by default; disable with `--no-stream-test`)
+
+## `REASN`
+
+**Capability:** Two related endpoint/provider checks around reasoning
+tokens:
+
+1. `reasoning_tokens_present` — with no special params, does the reply
+   carry a reasoning trace? Checked via a `reasoning_content` / `reasoning`
+   / `thinking` field on the message, or a non-zero
+   `usage.completion_tokens_details.reasoning_tokens`.
+2. `effort_control_native` / `effort_control_extra_body` — does the
+   endpoint accept a way to tune reasoning effort without a 400? Two wire
+   syntaxes are tried: the native top-level `reasoning_effort` Chat
+   Completions param (OpenAI o-series/gpt-5), and the OpenRouter-style
+   `extra_body={"reasoning": {"effort": ...}}` passthrough many other
+   providers proxy. Accepting the parameter is the bar — this does not
+   attempt to prove the setting changed model behaviour, only that the
+   syntax is honoured rather than rejected.
+
+- **Unit:** checks passed / checks run
+- **Range:** 0 to 3 checks
+- **Source:** `reasoning_test` (enabled by default; disable with `--no-reasoning-test`)
 
 ## `TSEL`
 
@@ -110,7 +145,7 @@ during Round 1 elicitation, rather than substituting a different tool
 when both are available in the offered schema. See `dispatch_conflicts`
 in the report for which tool the model substituted instead.
 
-## GRAM detail
+## GRAMT detail
 
 The *endpoint* implements OpenAI's real freeform/custom-tool
 transport end to end — `type: "custom"` with
@@ -120,22 +155,22 @@ grammar (unmodified, as OpenAI/Codex define it) as a genuine custom tool;
 PASS requires a real `custom` tool_call back (not a `function` one, and not
 silently dropped/ignored) whose raw `input` text is grammar-valid.
 
-This is a transport/capability question distinct from `PATCH`: a model can
-score `PATCH` 2/2 (know the syntax cold) while its endpoint scores `GRAM`
-0/1 (can't accept the tool that would let it use that knowledge natively) —
-confirmed directly: `gpt-5-mini`'s Copilot endpoint 400s on this request
-shape entirely; `gpt-5.6-luna`'s Responses API returns a genuine
-`custom_tool_call` once its wrapper's translator passes `type:"custom"`
-tools through instead of silently dropping them. See
-`~/bin/copilot-notes.md` for the full writeup.
+This is a transport/capability question distinct from `GRAMK`: a
+model can score `GRAMK` 2/2 (know the grammar cold) while its
+endpoint scores `GRAMT` 0/1 (can't accept the tool that would let
+it use that knowledge natively) — confirmed directly: `gpt-5-mini`'s
+Copilot endpoint 400s on this request shape entirely; `gpt-5.6-luna`'s
+Responses API returns a genuine `custom_tool_call` once its wrapper's
+translator passes `type:"custom"` tools through instead of silently
+dropping them. See `~/bin/copilot-notes.md` for the full writeup.
 
 - **Unit:** tasks passed / tasks run
 - **Range:** 0 to 1 task
-- **Source:** `gram_test` (enabled with `--gram-test`)
+- **Source:** `gram_transport_test` (enabled by default; disable with `--no-gram-transport-test`)
 
 ## Notes on scoring
 
-- All eight capabilities are pass/fail per task; the reported value is
+- All ten capabilities are pass/fail per task; the reported value is
   `passed/total`, not a normalized score. Compare N against the same
   codename's range before comparing two models' fractions.
 - `TCALL` is measured twice at different granularity: once as a single
@@ -144,12 +179,13 @@ tools through instead of silently dropping them. See
   (`behaviour.structured_tool_calls` / `.inline_json_in_content` /
   `.no_call_detected`). The markdown report shows both under one `TCALL`
   heading.
-- `QUOTE`, `GREP`, `ASKQ`, `PATCH`, `GRAM`, and `RJSON` are opt-in
-  (`--quote-test` / `--efficiency-test` / `--askq-test` / `--patch-test` /
-  `--gram-test` / `--rjson-test`); when not requested, their JSON field is
-  `null` and the
-  markdown report omits the section. `TSEL` has no flag — it's always
-  available once the main probe runs.
+- `QUOTE`, `GREP`, `ASKQ`, `GRAMK`, `GRAMT`, `RJSON`, `STRM`, and `REASN`
+  are on by default (`--quote-test` / `--efficiency-test` / `--askq-test` /
+  `--gram-knowledge-test` / `--gram-transport-test` / `--rjson-test` /
+  `--stream-test` / `--reasoning-test`); pass the `--no-*` form of any flag
+  to skip it, in which case its JSON field is `null` and the markdown
+  report omits the section. `TSEL` has no flag — it's always available
+  once the main probe runs.
 - `TSEL` failures are what used to show up as a bare, uncoded "Tool X was
   never dispatched" line in "Missing capabilities". They're now tagged
   `TSEL_<op>` for consistency with `QUOTE_<op>`, `GREP_<op>`, and

@@ -35,6 +35,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 from textwrap import indent
 
@@ -65,31 +66,57 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--quick-summary", action="store_true", dest="quick_summary",
                    help="Read reports/*/capabilities_*.json files and list models with native "
                         "structured tool_call support along with their main tool parameters.")
-    p.add_argument("--quote-test", action="store_true", dest="quote_test",
+    p.add_argument("--quote-test", action=argparse.BooleanOptionalAction, dest="quote_test",
+                   default=True,
                    help="Run an extra round that probes whether the model correctly escapes "
-                        "double-quotes inside JSON argument values.")
-    p.add_argument("--efficiency-test", action="store_true", dest="efficiency_test",
+                        "double-quotes inside JSON argument values. On by default; pass "
+                        "--no-quote-test to skip.")
+    p.add_argument("--efficiency-test", action=argparse.BooleanOptionalAction, dest="efficiency_test",
+                   default=True,
                    help="Run an extra round that probes whether the model prefers "
                         "filtered/targeted calls (grep, sed -n, head, offset/limit reads) "
-                        "over pulling entire large files/outputs into context.")
-    p.add_argument("--askq-test", action="store_true", dest="askq_test",
+                        "over pulling entire large files/outputs into context. On by "
+                        "default; pass --no-efficiency-test to skip.")
+    p.add_argument("--askq-test", action=argparse.BooleanOptionalAction, dest="askq_test",
+                   default=True,
                    help="Run an extra round (8 phrasing variants, full schema, one "
                         "sample each) that probes how strongly task wording drives "
-                        "the model to call its own ask_user_question tool.")
-    p.add_argument("--patch-test", action="store_true", dest="patch_test",
+                        "the model to call its own ask_user_question tool. On by "
+                        "default; pass --no-askq-test to skip.")
+    p.add_argument("--gram-knowledge-test", action=argparse.BooleanOptionalAction,
+                   dest="gram_knowledge_test", default=True,
                    help="Run an extra round (no tool schema) that probes whether "
                         "the model naturally knows OpenAI's apply_patch envelope "
-                        "syntax, parsed against the real Lark grammar.")
-    p.add_argument("--gram-test", action="store_true", dest="gram_test",
+                        "grammar, parsed against the real Lark grammar. On by "
+                        "default; pass --no-gram-knowledge-test to skip.")
+    p.add_argument("--gram-transport-test", action=argparse.BooleanOptionalAction,
+                   dest="gram_transport_test", default=True,
                    help="Run an extra round that sends a real OpenAI custom/freeform "
                         "tool (type:'custom', format:{type:'grammar', syntax:'lark'}) "
                         "and checks whether the endpoint honours it end to end, "
-                        "instead of falling back to classic function calling.")
-    p.add_argument("--rjson-test", action="store_true", dest="rjson_test",
+                        "instead of falling back to classic function calling. On by "
+                        "default; pass --no-gram-transport-test to skip.")
+    p.add_argument("--rjson-test", action=argparse.BooleanOptionalAction, dest="rjson_test",
+                   default=True,
                    help="Run an extra round that sends a strict "
                         "response_format:{type:'json_schema'} request (no tool schema) "
                         "and checks whether the endpoint honours schema-constrained "
-                        "structured output end to end.")
+                        "structured output end to end. On by default; pass "
+                        "--no-rjson-test to skip.")
+    p.add_argument("--stream-test", action=argparse.BooleanOptionalAction, dest="stream_test",
+                   default=True,
+                   help="Run an extra round that sends stream:true and checks whether "
+                        "the endpoint delivers real incremental SSE chunks rather than "
+                        "rejecting the parameter or buffering the whole reply into one "
+                        "chunk. On by default; pass --no-stream-test to skip.")
+    p.add_argument("--reasoning-test", action=argparse.BooleanOptionalAction, dest="reasoning_test",
+                   default=True,
+                   help="Run an extra round that checks whether the endpoint surfaces "
+                        "reasoning tokens (reasoning_content/reasoning/thinking field, "
+                        "or usage.reasoning_tokens) and whether it accepts either "
+                        "reasoning-effort syntax (native reasoning_effort param, or "
+                        "extra_body={'reasoning': {'effort': ...}}) without erroring. "
+                        "On by default; pass --no-reasoning-test to skip.")
     p.add_argument("--api-type", default="openai-completions",
                    choices=["openai-completions", "openai-responses", "anthropic-messages"],
                    help="The *actual* backend transport behind the endpoint/script, for "
@@ -205,7 +232,8 @@ _RESULT_KEYS = (
     "format_detection", "elicited_names", "inferred_tool_schema",
     "behaviour", "tool_dispatch", "dispatch_conflicts",
     "quote_test", "token_efficiency_test", "askq_test",
-    "patch_syntax_test", "gram_test", "rjson_test",
+    "gram_knowledge_test", "gram_transport_test", "rjson_test",
+    "stream_test", "reasoning_test",
 )
 
 
@@ -1347,7 +1375,7 @@ def ask_user_question_test_round(
     return {"askq_results": results, "askq_passed": passed, "askq_total": total}
 
 
-# -- apply_patch syntax test (PATCH) --------------------------------------------
+# -- apply_patch grammar-knowledge test (GRAMK) ------------------------
 #
 # Tests whether a model *naturally* knows OpenAI's apply_patch envelope
 # syntax (the format used by the real "custom"/freeform apply_patch tool --
@@ -1401,7 +1429,7 @@ def _get_apply_patch_parser() -> lark.Lark:
     return _apply_patch_parser
 
 
-PATCH_TASKS = {
+GRAM_KNOWLEDGE_TASKS = {
     "update_file": (
         "You need to edit the file /tmp/test.py: replace the exact string "
         "'x = 1' with 'x = 42'. Express this change as a patch using the "
@@ -1425,21 +1453,21 @@ def _strip_fences(text: str) -> str:
     return text.strip("\n") + "\n"
 
 
-def patch_syntax_test_round(client: openai.OpenAI) -> dict:
-    section("PATCH test -- does the model naturally know apply_patch syntax?")
+def gram_knowledge_test_round(client: openai.OpenAI) -> dict:
+    section("GRAMK test -- does the model naturally know apply_patch grammar?")
     print("\nNo tool schema is offered -- the model is asked in free text to produce")
     print("ONLY a raw apply_patch-format patch, then it's parsed against the real")
     print("grammar (not a loose regex). PASS = syntactically valid patch.\n")
 
     parser  = _get_apply_patch_parser()
     results: dict[str, dict] = {}
-    for op, task in PATCH_TASKS.items():
+    for op, task in GRAM_KNOWLEDGE_TASKS.items():
         messages = [
             {"role": "system", "content": "You are a helpful coding assistant."},
             {"role": "user", "content": task},
         ]
         resp = chat(client, messages)
-        _save_probe(f"patch_syntax_{op}", messages, resp)
+        _save_probe(f"gram_knowledge_{op}", messages, resp)
         raw  = resp.choices[0].message.content or ""
         text = _strip_fences(raw)
         entry: dict = {"task": task, "pass": False, "error": None, "raw_content": raw}
@@ -1455,14 +1483,14 @@ def patch_syntax_test_round(client: openai.OpenAI) -> dict:
 
     passed = sum(1 for r in results.values() if r["pass"])
     total  = len(results)
-    print(f"\nPATCH summary: {passed}/{total} passed")
-    return {"patch_syntax_results": results, "patch_syntax_passed": passed,
-            "patch_syntax_total": total}
+    print(f"\nGRAMK summary: {passed}/{total} passed")
+    return {"gram_knowledge_results": results, "gram_knowledge_passed": passed,
+            "gram_knowledge_total": total}
 
 
-# -- constrained-decoding / custom-tool test (GRAM) -----------------------------
+# -- constrained-decoding / custom-tool test (GRAMT) -------------------
 #
-# PATCH tests whether the model *knows* the apply_patch syntax from
+# GRAMK tests whether the model *knows* the apply_patch grammar from
 # pretraining, with no tool schema at all. This tests something different:
 # whether the *endpoint* actually implements OpenAI's real freeform/custom-tool
 # transport (`type: "custom"`, `format: {type: "grammar", syntax: "lark", ...}`)
@@ -1474,9 +1502,10 @@ def patch_syntax_test_round(client: openai.OpenAI) -> dict:
 # custom_tool_call once its wrapper script's translator is fixed to pass
 # `type: "custom"` tools through instead of silently dropping them).
 #
-# Sent verbatim as OpenAI/Codex define it -- unlike the PATCH grammar above,
-# this is not rewritten for Python-lark's zero-width-terminal restriction,
-# since it's the *endpoint's* grammar engine that has to accept it, not ours.
+# Sent verbatim as OpenAI/Codex define it -- unlike the GRAMK grammar
+# above, this is not rewritten for Python-lark's zero-width-terminal
+# restriction, since it's the *endpoint's* grammar engine that has to accept
+# it, not ours.
 # Source: https://github.com/openai/codex/blob/main/codex-rs/core/src/tools/handlers/apply_patch.lark
 
 _APPLY_PATCH_UPSTREAM_LARK_GRAMMAR = r"""
@@ -1501,7 +1530,7 @@ eof_line: "*** End of File" LF
 %import common.LF
 """
 
-GRAM_TASKS = {
+GRAM_TRANSPORT_TASKS = {
     "apply_patch": {
         "task": (
             "In the file /tmp/test.py, replace the exact string 'x = 1' with "
@@ -1533,8 +1562,8 @@ def _build_custom_tool(name: str, description: str, grammar: str) -> dict:
 # structured output end to end -- i.e. genuine constrained decoding on the
 # response body, not just the model being good at writing JSON.  This is an
 # endpoint/provider feature, deliberately separate from the model-behaviour
-# capabilities (TCALL & co).  Mirrors the GRAM test, which does the same for
-# grammar-constrained custom tools.
+# capabilities (TCALL & co).  Mirrors the GRAMT test, which does the
+# same for grammar-constrained custom tools.
 
 _RJSON_SCHEMA = {
     "type": "object",
@@ -1596,15 +1625,15 @@ def response_format_test_round(client: openai.OpenAI) -> dict:
             "rjson_passed": passed, "rjson_total": 1}
 
 
-def constrained_decoding_test_round(client: openai.OpenAI) -> dict:
-    section("GRAM test -- does the endpoint support real constrained-decoding custom tools?")
+def gram_transport_test_round(client: openai.OpenAI) -> dict:
+    section("GRAMT test -- does the endpoint support real constrained-decoding custom tools?")
     print("\nSends a type:'custom' tool with format:{type:'grammar', syntax:'lark', ...} --")
     print("the actual OpenAI freeform-tool transport, not classic JSON-schema function")
     print("calling with a tool that happens to be named the same thing. PASS = a genuine")
     print("'custom' tool_call comes back with grammar-valid input.\n")
 
     results: dict[str, dict] = {}
-    for op, spec in GRAM_TASKS.items():
+    for op, spec in GRAM_TRANSPORT_TASKS.items():
         tool = _build_custom_tool(spec["name"], spec["description"], spec["grammar"])
         messages = [
             {"role": "system", "content": "You are a helpful coding assistant with tool access."},
@@ -1620,7 +1649,7 @@ def constrained_decoding_test_round(client: openai.OpenAI) -> dict:
             results[op] = entry
             continue
 
-        _save_probe(f"gram_{op}", messages, resp, tools=[tool])
+        _save_probe(f"gram_transport_{op}", messages, resp, tools=[tool])
         msg        = resp.choices[0].message
         tool_calls = getattr(msg, "tool_calls", None) or []
         if not tool_calls:
@@ -1651,8 +1680,181 @@ def constrained_decoding_test_round(client: openai.OpenAI) -> dict:
 
     passed = sum(1 for r in results.values() if r["pass"])
     total  = len(results)
-    print(f"\nGRAM summary: {passed}/{total} passed")
-    return {"gram_results": results, "gram_passed": passed, "gram_total": total}
+    print(f"\nGRAMT summary: {passed}/{total} passed")
+    return {"gram_transport_results": results, "gram_transport_passed": passed,
+            "gram_transport_total": total}
+
+
+# -- STRM test ----------------------------------------------------------------
+#
+# Sends stream:true and checks whether the endpoint actually delivers the
+# response incrementally over SSE (multiple ChatCompletionChunk events, a
+# real gap between the first and last chunk) rather than either rejecting
+# the parameter outright or accepting it but buffering the whole reply into
+# one chunk. This is an endpoint/transport feature, independent of any
+# model-behaviour capability.
+
+_STREAM_TASK = "Count from 1 to 8, one number per line."
+
+
+def stream_test_round(client: openai.OpenAI) -> dict:
+    section("STRM test -- does the endpoint deliver real incremental SSE chunks?")
+    print("\nSends stream:true and iterates the response as Server-Sent Events. PASS =")
+    print("the request is accepted, more than one chunk arrives, content reconstructed")
+    print("from delta.content is non-empty, and a finish_reason chunk is seen.\n")
+
+    messages = [
+        {"role": "system", "content": "You are a helpful coding assistant."},
+        {"role": "user",   "content": _STREAM_TASK},
+    ]
+    entry: dict = {
+        "pass": False, "supported": False, "error": None,
+        "chunk_count": 0, "reconstructed_content": "", "finish_reason": None,
+        "time_to_first_chunk_seconds": None, "total_seconds": None,
+    }
+    t0 = time.monotonic()
+    try:
+        stream = client.chat.completions.create(
+            model=MODEL, messages=messages, temperature=0, timeout=300, stream=True,
+        )
+        chunks: list = []
+        content = ""
+        finish_reason = None
+        first_chunk_t = None
+        for chunk in stream:
+            chunks.append(chunk)
+            if first_chunk_t is None:
+                first_chunk_t = time.monotonic() - t0
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta
+            if delta and delta.content:
+                content += delta.content
+            if chunk.choices[0].finish_reason:
+                finish_reason = chunk.choices[0].finish_reason
+    except Exception as e:
+        entry["error"] = f"request failed: {str(e)[:500]}"
+        print(f"[stream] FAIL -- {entry['error']}")
+        return {"stream_results": {"basic": entry}, "stream_passed": 0, "stream_total": 1}
+
+    total_t = time.monotonic() - t0
+    entry["supported"]                     = True
+    entry["chunk_count"]                   = len(chunks)
+    entry["reconstructed_content"]         = content
+    entry["finish_reason"]                 = finish_reason
+    entry["time_to_first_chunk_seconds"]   = round(first_chunk_t, 3) if first_chunk_t is not None else None
+    entry["total_seconds"]                 = round(total_t, 3)
+    if _PROBE_DIR is not None:
+        safe_label = "stream_basic"
+        with open(_PROBE_DIR / f"{safe_label}.json", "w") as f:
+            json.dump({"label": safe_label, "messages": messages,
+                      "chunk_count": len(chunks), "finish_reason": finish_reason,
+                      "reconstructed_content": content,
+                      "chunks": [c.model_dump() for c in chunks]}, f, indent=2)
+
+    entry["pass"] = len(chunks) > 1 and bool(content.strip()) and finish_reason is not None
+    verdict = "PASS" if entry["pass"] else "FAIL"
+    if not entry["pass"] and not entry["error"]:
+        entry["error"] = (f"accepted stream:true but delivered {len(chunks)} chunk(s) "
+                          f"(finish_reason={finish_reason!r}) -- looks buffered, not real SSE")
+    print(f"[stream] {verdict} -- {len(chunks)} chunks, "
+          f"first chunk at {entry['time_to_first_chunk_seconds']}s, "
+          f"total {entry['total_seconds']}s, finish_reason={finish_reason!r}")
+
+    passed = 1 if entry["pass"] else 0
+    print(f"\nSTRM summary: {passed}/1 passed")
+    return {"stream_results": {"basic": entry}, "stream_passed": passed, "stream_total": 1}
+
+
+# -- REASN test ------------------------------------------------------------------
+#
+# Two things, both endpoint/provider features rather than raw model
+# knowledge:
+#   1. does the endpoint surface reasoning tokens at all -- a
+#      `reasoning_content`/`reasoning`/`thinking` field on the message, or a
+#      non-zero `usage.completion_tokens_details.reasoning_tokens` -- for a
+#      task that plausibly benefits from it, with no special params sent.
+#   2. does the endpoint accept either of the two real-world syntaxes for
+#      tuning reasoning effort without erroring: OpenAI's native top-level
+#      `reasoning_effort` (Chat Completions param on o-series/gpt-5), or the
+#      OpenRouter-style `extra_body={"reasoning": {"effort": ...}}` passthrough
+#      many other providers proxy. Accepting the parameter without a 400 is
+#      the bar -- this does not attempt to prove the effort setting changed
+#      model behaviour, only that the wire syntax is honoured rather than
+#      rejected.
+
+_REASON_TASK = ("Solve step by step: a train leaves city A at 60mph, another leaves "
+                 "city B (300 miles away) at 40mph toward each other. How long until "
+                 "they meet, and how far from A?")
+
+
+def _extract_reasoning(resp) -> dict:
+    msg  = resp.choices[0].message
+    dump = msg.model_dump()
+    for field in ("reasoning_content", "reasoning", "thinking", "thought"):
+        val = dump.get(field)
+        if isinstance(val, str) and val.strip():
+            return {"found": True, "field": field, "chars": len(val)}
+    usage = getattr(resp, "usage", None)
+    details = getattr(usage, "completion_tokens_details", None) if usage else None
+    reasoning_tokens = getattr(details, "reasoning_tokens", None) if details else None
+    if reasoning_tokens:
+        return {"found": True, "field": "usage.completion_tokens_details.reasoning_tokens",
+                "chars": None, "reasoning_tokens": reasoning_tokens}
+    return {"found": False, "field": None, "chars": 0}
+
+
+def reasoning_test_round(client: openai.OpenAI) -> dict:
+    section("REASN test -- reasoning tokens exposed, and can effort be set?")
+    print("\nCheck 1: with no special params, does the response carry a reasoning trace")
+    print("(reasoning_content/reasoning/thinking field, or usage.reasoning_tokens)?")
+    print("Check 2: does the endpoint accept reasoning_effort (native OpenAI param) or")
+    print("extra_body={'reasoning': {'effort': ...}} (OpenRouter-style) without a 400?\n")
+
+    results: dict[str, dict] = {}
+    messages = [
+        {"role": "system", "content": "You are a helpful reasoning assistant."},
+        {"role": "user",   "content": _REASON_TASK},
+    ]
+
+    baseline_entry: dict = {"pass": False, "error": None}
+    try:
+        resp = client.chat.completions.create(model=MODEL, messages=messages, timeout=300)
+        _save_probe("reasoning_baseline", messages, resp)
+        info = _extract_reasoning(resp)
+        baseline_entry.update(info)
+        baseline_entry["pass"] = info["found"]
+        print(f"[baseline] {'PASS' if info['found'] else 'FAIL'} -- "
+              f"field={info['field']!r}")
+    except Exception as e:
+        baseline_entry["error"] = f"request failed: {str(e)[:500]}"
+        print(f"[baseline] FAIL -- {baseline_entry['error']}")
+    results["reasoning_tokens_present"] = baseline_entry
+
+    def _try_effort(label: str, kwargs: dict) -> dict:
+        entry: dict = {"pass": False, "error": None}
+        try:
+            resp = client.chat.completions.create(
+                model=MODEL, messages=messages, timeout=300, **kwargs,
+            )
+            _save_probe(f"reasoning_effort_{label}", messages, resp)
+            info = _extract_reasoning(resp)
+            entry.update(info)
+            entry["pass"] = True  # accepted without error -- the bar for this check
+            print(f"[effort_{label}] PASS -- accepted, reasoning_found={info['found']}")
+        except Exception as e:
+            entry["error"] = f"request failed: {str(e)[:500]}"
+            print(f"[effort_{label}] FAIL -- {entry['error']}")
+        return entry
+
+    results["effort_control_native"]     = _try_effort("native", {"reasoning_effort": "high"})
+    results["effort_control_extra_body"] = _try_effort(
+        "extra_body", {"extra_body": {"reasoning": {"effort": "high"}}})
+
+    passed = sum(1 for r in results.values() if r["pass"])
+    total  = len(results)
+    print(f"\nREASN summary: {passed}/{total} passed")
+    return {"reason_results": results, "reason_passed": passed, "reason_total": total}
 
 
 # -- markdown report -----------------------------------------------------------
@@ -1688,9 +1890,11 @@ def render_markdown_report(output: dict) -> str:
     quote_test = output.get("quote_test")
     tok_test   = output.get("token_efficiency_test")
     askq_test  = output.get("askq_test")
-    patch_test = output.get("patch_syntax_test")
-    gram_test  = output.get("gram_test")
+    gram_knowledge_test = output.get("gram_knowledge_test")
+    gram_transport_test = output.get("gram_transport_test")
     rjson_test = output.get("rjson_test")
+    stream_test = output.get("stream_test")
+    reasoning_test = output.get("reasoning_test")
 
     lines.append("## Capabilities summary")
     lines.append("")
@@ -1707,29 +1911,37 @@ def render_markdown_report(output: dict) -> str:
     if quote_test and "error" not in quote_test:
         lines.append(f"| `QUOTE` | {quote_test.get('quote_test_passed', 0)}/{quote_test.get('quote_test_total', 0)} |")
     else:
-        lines.append("| `QUOTE` | *(not run — pass `--quote-test`)* |")
+        lines.append("| `QUOTE` | *(not run — rerun without `--no-quote-test`)* |")
     if tok_test and "error" not in tok_test:
         lines.append(f"| `GREP` | {tok_test.get('token_efficiency_passed', 0)}/{tok_test.get('token_efficiency_total', 0)} |")
     else:
-        lines.append("| `GREP` | *(not run — pass `--efficiency-test`)* |")
+        lines.append("| `GREP` | *(not run — rerun without `--no-efficiency-test`)* |")
     if askq_test and "error" not in askq_test:
         askq_passed = askq_test.get("askq_passed", 0)
         askq_total  = askq_test.get("askq_total", 0)
         lines.append(f"| `ASKQ` | {askq_passed}/{askq_total} ({_likert_label(askq_passed, askq_total)}) |")
     else:
-        lines.append("| `ASKQ` | *(not run — pass `--askq-test`)* |")
-    if patch_test and "error" not in patch_test:
-        lines.append(f"| `PATCH` | {patch_test.get('patch_syntax_passed', 0)}/{patch_test.get('patch_syntax_total', 0)} |")
+        lines.append("| `ASKQ` | *(not run — rerun without `--no-askq-test`)* |")
+    if gram_knowledge_test and "error" not in gram_knowledge_test:
+        lines.append(f"| `GRAMK` | {gram_knowledge_test.get('gram_knowledge_passed', 0)}/{gram_knowledge_test.get('gram_knowledge_total', 0)} |")
     else:
-        lines.append("| `PATCH` | *(not run — pass `--patch-test`)* |")
-    if gram_test and "error" not in gram_test:
-        lines.append(f"| `GRAM` | {gram_test.get('gram_passed', 0)}/{gram_test.get('gram_total', 0)} |")
+        lines.append("| `GRAMK` | *(not run — rerun without `--no-gram-knowledge-test`)* |")
+    if gram_transport_test and "error" not in gram_transport_test:
+        lines.append(f"| `GRAMT` | {gram_transport_test.get('gram_transport_passed', 0)}/{gram_transport_test.get('gram_transport_total', 0)} |")
     else:
-        lines.append("| `GRAM` | *(not run — pass `--gram-test`)* |")
+        lines.append("| `GRAMT` | *(not run — rerun without `--no-gram-transport-test`)* |")
     if rjson_test and "error" not in rjson_test:
         lines.append(f"| `RJSON` | {rjson_test.get('rjson_passed', 0)}/{rjson_test.get('rjson_total', 0)} |")
     else:
-        lines.append("| `RJSON` | *(not run — pass `--rjson-test`)* |")
+        lines.append("| `RJSON` | *(not run — rerun without `--no-rjson-test`)* |")
+    if stream_test and "error" not in stream_test:
+        lines.append(f"| `STRM` | {stream_test.get('stream_passed', 0)}/{stream_test.get('stream_total', 0)} |")
+    else:
+        lines.append("| `STRM` | *(not run — rerun without `--no-stream-test`)* |")
+    if reasoning_test and "error" not in reasoning_test:
+        lines.append(f"| `REASN` | {reasoning_test.get('reason_passed', 0)}/{reasoning_test.get('reason_total', 0)} |")
+    else:
+        lines.append("| `REASN` | *(not run — rerun without `--no-reasoning-test`)* |")
     dispatch_conflicts = output.get("dispatch_conflicts") or {}
     elicited_names_all = output.get("elicited_names") or {}
     tsel_total = sum(1 for fn in elicited_names_all.values() if fn)
@@ -1894,11 +2106,11 @@ def render_markdown_report(output: dict) -> str:
         lines.append(f"Error: {askq_test['error']}")
         lines.append("")
 
-    if patch_test and "error" not in patch_test:
-        results = patch_test.get("patch_syntax_results") or {}
-        passed  = patch_test.get("patch_syntax_passed", 0)
-        total   = patch_test.get("patch_syntax_total", 0)
-        lines.append("## apply_patch syntax test (`PATCH`)")
+    if gram_knowledge_test and "error" not in gram_knowledge_test:
+        results = gram_knowledge_test.get("gram_knowledge_results") or {}
+        passed  = gram_knowledge_test.get("gram_knowledge_passed", 0)
+        total   = gram_knowledge_test.get("gram_knowledge_total", 0)
+        lines.append("## apply_patch grammar-knowledge test (`GRAMK`)")
         lines.append("")
         lines.append(f"**{passed}/{total} passed** — no tool schema offered; the model is asked "
                      "in free text to produce a raw apply_patch-format patch, parsed against the "
@@ -1913,24 +2125,24 @@ def render_markdown_report(output: dict) -> str:
             note   = _md_escape(r.get("error") or "")
             lines.append(f"| {op} | {result} | {note} |")
         lines.append("")
-    elif patch_test and patch_test.get("error"):
-        lines.append("## apply_patch syntax test (`PATCH`)")
+    elif gram_knowledge_test and gram_knowledge_test.get("error"):
+        lines.append("## apply_patch grammar-knowledge test (`GRAMK`)")
         lines.append("")
-        lines.append(f"Error: {patch_test['error']}")
+        lines.append(f"Error: {gram_knowledge_test['error']}")
         lines.append("")
 
-    if gram_test and "error" not in gram_test:
-        results = gram_test.get("gram_results") or {}
-        passed  = gram_test.get("gram_passed", 0)
-        total   = gram_test.get("gram_total", 0)
-        lines.append("## Constrained-decoding / custom-tool test (`GRAM`)")
+    if gram_transport_test and "error" not in gram_transport_test:
+        results = gram_transport_test.get("gram_transport_results") or {}
+        passed  = gram_transport_test.get("gram_transport_passed", 0)
+        total   = gram_transport_test.get("gram_transport_total", 0)
+        lines.append("## Constrained-decoding / custom-tool test (`GRAMT`)")
         lines.append("")
         lines.append(f"**{passed}/{total} passed** — sends a real OpenAI `type:\"custom\"` "
                      "freeform tool with `format:{type:\"grammar\", syntax:\"lark\"}`; PASS "
                      "requires a genuine `custom` tool_call back with grammar-valid input "
                      "(not a classic `function` tool_call, and not silently ignored). Tests the "
                      "*endpoint's* transport support, independent of whether the model knows the "
-                     "syntax (`PATCH`) — see `~/bin/copilot-notes.md`.")
+                     "syntax (`GRAMK`) — see `~/bin/copilot-notes.md`.")
         lines.append("")
         lines.append("| Operation | Result | Tool call type | Notes |")
         lines.append("|---|---|---|---|")
@@ -1940,10 +2152,10 @@ def render_markdown_report(output: dict) -> str:
             note   = _md_escape(r.get("error") or "")
             lines.append(f"| {op} | {result} | `{tct}` | {note} |")
         lines.append("")
-    elif gram_test and gram_test.get("error"):
-        lines.append("## Constrained-decoding / custom-tool test (`GRAM`)")
+    elif gram_transport_test and gram_transport_test.get("error"):
+        lines.append("## Constrained-decoding / custom-tool test (`GRAMT`)")
         lines.append("")
-        lines.append(f"Error: {gram_test['error']}")
+        lines.append(f"Error: {gram_transport_test['error']}")
         lines.append("")
 
     if rjson_test and "error" not in rjson_test:
@@ -1970,6 +2182,64 @@ def render_markdown_report(output: dict) -> str:
         lines.append("## Structured-output test (`RJSON`)")
         lines.append("")
         lines.append(f"Error: {rjson_test['error']}")
+        lines.append("")
+
+    if stream_test and "error" not in stream_test:
+        r      = (stream_test.get("stream_results") or {}).get("basic") or {}
+        passed = stream_test.get("stream_passed", 0)
+        total  = stream_test.get("stream_total", 0)
+        lines.append("## SSE streaming test (`STRM`)")
+        lines.append("")
+        lines.append(f"**{passed}/{total} passed** — sends `stream:true`; PASS requires more "
+                     "than one chunk, non-empty reconstructed content, and a finish_reason "
+                     "chunk. FAIL includes the endpoint rejecting `stream:true` outright and "
+                     "accepting it but buffering the whole reply into one chunk.")
+        lines.append("")
+        result = "PASS" if r.get("pass") else "FAIL"
+        note   = _md_escape(r.get("error") or "")
+        lines.append(f"- Result: {result}")
+        lines.append(f"- Chunks: {r.get('chunk_count', '?')}")
+        lines.append(f"- Time to first chunk: {r.get('time_to_first_chunk_seconds', '?')}s")
+        lines.append(f"- Total time: {r.get('total_seconds', '?')}s")
+        lines.append(f"- finish_reason: `{r.get('finish_reason')}`")
+        if note:
+            lines.append(f"- Notes: {note}")
+        lines.append("")
+    elif stream_test and stream_test.get("error"):
+        lines.append("## SSE streaming test (`STRM`)")
+        lines.append("")
+        lines.append(f"Error: {stream_test['error']}")
+        lines.append("")
+
+    if reasoning_test and "error" not in reasoning_test:
+        results = reasoning_test.get("reason_results") or {}
+        passed  = reasoning_test.get("reason_passed", 0)
+        total   = reasoning_test.get("reason_total", 0)
+        lines.append("## Reasoning-tokens & effort-control test (`REASN`)")
+        lines.append("")
+        lines.append(f"**{passed}/{total} passed** — `reasoning_tokens_present` checks (no "
+                     "special params) whether the reply carries a reasoning trace "
+                     "(`reasoning_content`/`reasoning`/`thinking` field, or "
+                     "`usage.completion_tokens_details.reasoning_tokens`). "
+                     "`effort_control_native` and `effort_control_extra_body` each check "
+                     "whether the endpoint accepts one reasoning-effort syntax — the native "
+                     "top-level `reasoning_effort` Chat Completions param, and the "
+                     "OpenRouter-style `extra_body={'reasoning': {'effort': ...}}` passthrough "
+                     "— without erroring. Accepting the parameter is the bar; this does not "
+                     "confirm the effort setting changed model behaviour.")
+        lines.append("")
+        lines.append("| Check | Result | Field | Notes |")
+        lines.append("|---|---|---|---|")
+        for op, r in results.items():
+            result = "PASS" if r.get("pass") else "FAIL"
+            field  = r.get("field") or "*(none)*"
+            note   = _md_escape(r.get("error") or "")
+            lines.append(f"| {op} | {result} | `{field}` | {note} |")
+        lines.append("")
+    elif reasoning_test and reasoning_test.get("error"):
+        lines.append("## Reasoning-tokens & effort-control test (`REASN`)")
+        lines.append("")
+        lines.append(f"Error: {reasoning_test['error']}")
         lines.append("")
 
     lines.append("## Missing capabilities")
@@ -2030,7 +2300,7 @@ def _find_missing_capabilities(output: dict) -> list[str]:
 
     quote_test = output.get("quote_test")
     if quote_test is None:
-        problems.append("`QUOTE` capability not tested (rerun with --quote-test).")
+        problems.append("`QUOTE` capability not tested (rerun without --no-quote-test).")
     elif quote_test.get("error"):
         problems.append(f"`QUOTE` test failed to run: {quote_test['error']}")
     else:
@@ -2040,7 +2310,7 @@ def _find_missing_capabilities(output: dict) -> list[str]:
 
     tok_test = output.get("token_efficiency_test")
     if tok_test is None:
-        problems.append("`GREP` capability not tested (rerun with --efficiency-test).")
+        problems.append("`GREP` capability not tested (rerun without --no-efficiency-test).")
     elif tok_test.get("error"):
         problems.append(f"`GREP` test failed to run: {tok_test['error']}")
     else:
@@ -2050,7 +2320,7 @@ def _find_missing_capabilities(output: dict) -> list[str]:
 
     askq_test = output.get("askq_test")
     if askq_test is None:
-        problems.append("`ASKQ` capability not tested (rerun with --askq-test).")
+        problems.append("`ASKQ` capability not tested (rerun without --no-askq-test).")
     elif askq_test.get("error"):
         problems.append(f"`ASKQ` test failed to run: {askq_test['error']}")
     else:
@@ -2060,35 +2330,55 @@ def _find_missing_capabilities(output: dict) -> list[str]:
                 problems.append(f"`ASKQ_{variant}` FAILED — called `{fn}` instead of "
                                 "asking the user.")
 
-    patch_test = output.get("patch_syntax_test")
-    if patch_test is None:
-        problems.append("`PATCH` capability not tested (rerun with --patch-test).")
-    elif patch_test.get("error"):
-        problems.append(f"`PATCH` test failed to run: {patch_test['error']}")
+    gram_knowledge_test = output.get("gram_knowledge_test")
+    if gram_knowledge_test is None:
+        problems.append("`GRAMK` capability not tested (rerun without --no-gram-knowledge-test).")
+    elif gram_knowledge_test.get("error"):
+        problems.append(f"`GRAMK` test failed to run: {gram_knowledge_test['error']}")
     else:
-        for op, r in (patch_test.get("patch_syntax_results") or {}).items():
+        for op, r in (gram_knowledge_test.get("gram_knowledge_results") or {}).items():
             if not r.get("pass"):
-                problems.append(f"`PATCH_{op}` FAILED — {r.get('error', 'unknown reason')}")
+                problems.append(f"`GRAMK_{op}` FAILED — {r.get('error', 'unknown reason')}")
 
-    gram_test = output.get("gram_test")
-    if gram_test is None:
-        problems.append("`GRAM` capability not tested (rerun with --gram-test).")
-    elif gram_test.get("error"):
-        problems.append(f"`GRAM` test failed to run: {gram_test['error']}")
+    gram_transport_test = output.get("gram_transport_test")
+    if gram_transport_test is None:
+        problems.append("`GRAMT` capability not tested (rerun without --no-gram-transport-test).")
+    elif gram_transport_test.get("error"):
+        problems.append(f"`GRAMT` test failed to run: {gram_transport_test['error']}")
     else:
-        for op, r in (gram_test.get("gram_results") or {}).items():
+        for op, r in (gram_transport_test.get("gram_transport_results") or {}).items():
             if not r.get("pass"):
-                problems.append(f"`GRAM_{op}` FAILED — {r.get('error', 'unknown reason')}")
+                problems.append(f"`GRAMT_{op}` FAILED — {r.get('error', 'unknown reason')}")
 
     rjson_test = output.get("rjson_test")
     if rjson_test is None:
-        problems.append("`RJSON` capability not tested (rerun with --rjson-test).")
+        problems.append("`RJSON` capability not tested (rerun without --no-rjson-test).")
     elif rjson_test.get("error"):
         problems.append(f"`RJSON` test failed to run: {rjson_test['error']}")
     else:
         for op, r in (rjson_test.get("rjson_results") or {}).items():
             if not r.get("pass"):
                 problems.append(f"`RJSON_{op}` FAILED — {r.get('error', 'unknown reason')}")
+
+    stream_test = output.get("stream_test")
+    if stream_test is None:
+        problems.append("`STRM` capability not tested (rerun without --no-stream-test).")
+    elif stream_test.get("error"):
+        problems.append(f"`STRM` test failed to run: {stream_test['error']}")
+    else:
+        for op, r in (stream_test.get("stream_results") or {}).items():
+            if not r.get("pass"):
+                problems.append(f"`STRM_{op}` FAILED — {r.get('error', 'unknown reason')}")
+
+    reasoning_test = output.get("reasoning_test")
+    if reasoning_test is None:
+        problems.append("`REASN` capability not tested (rerun without --no-reasoning-test).")
+    elif reasoning_test.get("error"):
+        problems.append(f"`REASN` test failed to run: {reasoning_test['error']}")
+    else:
+        for op, r in (reasoning_test.get("reason_results") or {}).items():
+            if not r.get("pass"):
+                problems.append(f"`REASN_{op}` FAILED — {r.get('error', 'unknown reason')}")
 
     return problems
 
@@ -2143,9 +2433,11 @@ def main():
         "quote_test":           None,
         "token_efficiency_test": None,
         "askq_test":            None,
-        "patch_syntax_test":    None,
-        "gram_test":            None,
+        "gram_knowledge_test":  None,
+        "gram_transport_test":  None,
         "rjson_test":           None,
+        "stream_test":          None,
+        "reasoning_test":       None,
     }
 
     md_path = _capabilities_md_path(out_path)
@@ -2278,29 +2570,29 @@ def main():
                 output["askq_test"] = {"error": str(e)}
                 print(f"\nERROR in ASKQ test round: {e}")
 
-    if args.patch_test:
+    if args.gram_knowledge_test:
         try:
-            pt = patch_syntax_test_round(client)
-            output["patch_syntax_test"] = pt
+            gkt = gram_knowledge_test_round(client)
+            output["gram_knowledge_test"] = gkt
         except Exception as e:
-            if _keep_previous_result(e, previous, "patch_syntax_test"):
-                output["patch_syntax_test"] = previous["patch_syntax_test"]
-                print(f"\nERROR in PATCH test round (429): {e} -- keeping previous run's result")
+            if _keep_previous_result(e, previous, "gram_knowledge_test"):
+                output["gram_knowledge_test"] = previous["gram_knowledge_test"]
+                print(f"\nERROR in GRAMK test round (429): {e} -- keeping previous run's result")
             else:
-                output["patch_syntax_test"] = {"error": str(e)}
-                print(f"\nERROR in PATCH test round: {e}")
+                output["gram_knowledge_test"] = {"error": str(e)}
+                print(f"\nERROR in GRAMK test round: {e}")
 
-    if args.gram_test:
+    if args.gram_transport_test:
         try:
-            gt = constrained_decoding_test_round(client)
-            output["gram_test"] = gt
+            gtt = gram_transport_test_round(client)
+            output["gram_transport_test"] = gtt
         except Exception as e:
-            if _keep_previous_result(e, previous, "gram_test"):
-                output["gram_test"] = previous["gram_test"]
-                print(f"\nERROR in GRAM test round (429): {e} -- keeping previous run's result")
+            if _keep_previous_result(e, previous, "gram_transport_test"):
+                output["gram_transport_test"] = previous["gram_transport_test"]
+                print(f"\nERROR in GRAMT test round (429): {e} -- keeping previous run's result")
             else:
-                output["gram_test"] = {"error": str(e)}
-                print(f"\nERROR in GRAM test round: {e}")
+                output["gram_transport_test"] = {"error": str(e)}
+                print(f"\nERROR in GRAMT test round: {e}")
 
     if args.rjson_test:
         try:
@@ -2313,6 +2605,30 @@ def main():
             else:
                 output["rjson_test"] = {"error": str(e)}
                 print(f"\nERROR in RJSON test round: {e}")
+
+    if args.stream_test:
+        try:
+            st = stream_test_round(client)
+            output["stream_test"] = st
+        except Exception as e:
+            if _keep_previous_result(e, previous, "stream_test"):
+                output["stream_test"] = previous["stream_test"]
+                print(f"\nERROR in STRM test round (429): {e} -- keeping previous run's result")
+            else:
+                output["stream_test"] = {"error": str(e)}
+                print(f"\nERROR in STRM test round: {e}")
+
+    if args.reasoning_test:
+        try:
+            rst = reasoning_test_round(client)
+            output["reasoning_test"] = rst
+        except Exception as e:
+            if _keep_previous_result(e, previous, "reasoning_test"):
+                output["reasoning_test"] = previous["reasoning_test"]
+                print(f"\nERROR in REASN test round (429): {e} -- keeping previous run's result")
+            else:
+                output["reasoning_test"] = {"error": str(e)}
+                print(f"\nERROR in REASN test round: {e}")
 
     save()
 

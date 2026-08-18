@@ -1,23 +1,23 @@
 {
-  "model": "glm-5.3",
-  "endpoint": "https://api.z.ai/api/coding/paas/v4",
+  "model": "deepseek-v4-flash",
+  "endpoint": "https://api.deepseek.com",
   "api_type": "OpenAI Completions",
   "status": "ok",
   "error": null,
   "format_detection": {
     "detected_format": "structured_tool_calls",
     "has_structured_tool_calls": true,
-    "raw_content_snippet": null
+    "raw_content_snippet": "I'll read the file for you."
   },
   "elicited_names": {
     "read_file": "read_file",
     "write_file": "write_file",
-    "update_file": "str_replace_editor",
-    "execute_bash": "bash",
+    "update_file": "replace_in_file",
+    "execute_bash": "run_shell_command",
     "ask_user_question": "ask_user_question",
     "list_directory": "list_directory",
     "search_files": "grep",
-    "glob": "glob"
+    "glob": "glob.glob"
   },
   "inferred_tool_schema": [
     {
@@ -66,36 +66,28 @@
     {
       "type": "function",
       "function": {
-        "name": "str_replace_editor",
+        "name": "replace_in_file",
         "description": "Perform the 'update_file' operation.",
         "parameters": {
           "type": "object",
           "properties": {
-            "command": {
+            "file_path": {
               "type": "string",
-              "description": "command (must be 'str_replace')",
-              "enum": [
-                "str_replace"
-              ]
+              "description": "file path"
             },
-            "path": {
+            "old_string": {
               "type": "string",
-              "description": "path"
+              "description": "old string"
             },
-            "old_str": {
+            "new_string": {
               "type": "string",
-              "description": "old str"
-            },
-            "new_str": {
-              "type": "string",
-              "description": "new str"
+              "description": "new string"
             }
           },
           "required": [
-            "command",
-            "path",
-            "old_str",
-            "new_str"
+            "file_path",
+            "old_string",
+            "new_string"
           ]
         }
       }
@@ -103,7 +95,7 @@
     {
       "type": "function",
       "function": {
-        "name": "bash",
+        "name": "run_shell_command",
         "description": "Perform the 'execute_bash' operation.",
         "parameters": {
           "type": "object",
@@ -189,14 +181,14 @@
     {
       "type": "function",
       "function": {
-        "name": "glob",
+        "name": "glob_glob",
         "description": "Perform the 'glob' operation.",
         "parameters": {
           "type": "object",
           "properties": {
-            "pattern": {
+            "pathname": {
               "type": "string",
-              "description": "pattern"
+              "description": "pathname"
             },
             "recursive": {
               "type": "boolean",
@@ -204,7 +196,7 @@
             }
           },
           "required": [
-            "pattern",
+            "pathname",
             "recursive"
           ]
         }
@@ -232,7 +224,7 @@
         "content": "content"
       }
     },
-    "bash": {
+    "run_shell_command": {
       "python_function": "t_run",
       "param_map": {
         "command": "command"
@@ -257,9 +249,11 @@
         "path": "path"
       }
     },
-    "glob": {
-      "python_function": "t_glob",
-      "param_map": {}
+    "glob_glob": {
+      "python_function": "t_read",
+      "param_map": {
+        "pathname": "path"
+      }
     }
   },
   "dispatch_conflicts": {
@@ -288,21 +282,23 @@
           "command": "echo \"hello \\\"world\\\"\""
         },
         "isolated": true,
-        "function_name": "bash"
+        "function_name": "run_shell_command"
       },
       "update_file": {
         "task": "In /tmp/test.py, replace the string x = \"old value\" with x = \"new value\". Do not rewrite the whole file.",
-        "pass": false,
-        "error": "double-quote not found in any argument value",
+        "pass": true,
+        "error": null,
         "structured": true,
         "parsed_args": {
-          "path": "/tmp/test.py"
+          "file_path": "/tmp/test.py",
+          "old_string": "x = \"old value\"",
+          "new_string": "x = \"new value\""
         },
         "isolated": true,
-        "function_name": "read_file"
+        "function_name": "replace_in_file"
       }
     },
-    "quote_test_passed": 2,
+    "quote_test_passed": 3,
     "quote_test_total": 3
   },
   "token_efficiency_test": {
@@ -311,27 +307,27 @@
         "task": "The file /var/log/app.log is 500,000 lines long. Find all lines containing the exact string 'FATAL ERROR' and show them to me.",
         "pass": true,
         "reason": "command includes a filtering tool (grep/awk/sed/head/tail/wc/cut)",
-        "function_name": "bash",
+        "function_name": "run_shell_command",
         "python_function": "t_run",
         "parsed_args": {
-          "command": "if [ -f /var/log/app.log ]; then echo \"=== Match count ===\"; grep -c -F 'FATAL ERROR' /var/log/app.log || true; echo \"=== Matching lines ===\"; grep -n -F 'FATAL ERROR' /var/log/app.log | head -100; else echo \"File not found: /var/log/app.log\"; fi"
+          "command": "grep -n 'FATAL ERROR' /var/log/app.log"
         }
       },
       "count_occurrences": {
         "task": "The file /var/data/access.log has several million lines. Tell me how many lines contain the IP address 203.0.113.42. I only need the count.",
         "pass": true,
         "reason": "command includes a filtering tool (grep/awk/sed/head/tail/wc/cut)",
-        "function_name": "bash",
+        "function_name": "run_shell_command",
         "python_function": "t_run",
         "parsed_args": {
-          "command": "grep -c '203\\.0\\.113\\.42' /var/data/access.log"
+          "command": "grep -c \"203\\.0\\.113\\.42\" /var/data/access.log"
         }
       },
       "specific_line": {
         "task": "The file /opt/build/output.txt is over a million lines long. What is on line 48213 of that file?",
         "pass": true,
         "reason": "command includes a filtering tool (grep/awk/sed/head/tail/wc/cut)",
-        "function_name": "bash",
+        "function_name": "run_shell_command",
         "python_function": "t_run",
         "parsed_args": {
           "command": "sed -n '48213p' /opt/build/output.txt"
@@ -340,11 +336,13 @@
       "check_string_exists": {
         "task": "The file /var/log/build.log is huge (hundreds of thousands of lines). Does the word 'DeprecationWarning' appear anywhere in it? Just answer yes or no.",
         "pass": true,
-        "reason": "command includes a filtering tool (grep/awk/sed/head/tail/wc/cut)",
-        "function_name": "bash",
-        "python_function": "t_run",
+        "reason": "dedicated search tool used -- inherently filtered",
+        "function_name": "grep",
+        "python_function": "t_search",
         "parsed_args": {
-          "command": "grep -q 'DeprecationWarning' /var/log/build.log && echo YES || echo NO"
+          "pattern": "DeprecationWarning",
+          "path": "/var/log/build.log",
+          "recursive": false
         }
       },
       "function_definition_search": {
@@ -363,7 +361,7 @@
         "task": "List all currently running processes, but I only care about the ones related to 'python'. Show me just those.",
         "pass": true,
         "reason": "command includes a filtering tool (grep/awk/sed/head/tail/wc/cut)",
-        "function_name": "bash",
+        "function_name": "run_shell_command",
         "python_function": "t_run",
         "parsed_args": {
           "command": "ps aux | grep -i python | grep -v grep"
@@ -381,7 +379,7 @@
         "pass": true,
         "function_name": "ask_user_question",
         "parsed_args": {
-          "question": "Before we proceed: would you like to overwrite /tmp/test.txt directly, or should I create a backup of the existing file first?"
+          "question": "Do you want to overwrite /tmp/test.txt directly, or should I create a backup first before making any changes?"
         }
       },
       "imperative_must": {
@@ -406,27 +404,26 @@
         "task": "I'm not sure whether you want me to overwrite /tmp/test.txt or make a backup first. Which do you prefer?",
         "system": "You are a helpful assistant with tool access.",
         "pass": false,
-        "function_name": "bash",
-        "parsed_args": {
-          "command": "ls -la /tmp/test.txt 2>/dev/null && echo \"---\" && wc -c /tmp/test.txt 2>/dev/null || echo \"File does not exist\""
-        }
+        "function_name": null,
+        "parsed_args": null,
+        "raw_content": "That's a thoughtful question \u2014 and honestly, it depends on the situation. My general preference is:\n\n**Make a backup first** \u2014 it's almost always the safer choice. Overwriting destroys the original content, and if it turns out you needed that file later (or the new write is corrupted/incomplete), you're out of luck. A backup is cheap insurance.\n\nHowever, there are cases where a backup is unnecessary overhead:\n\n- The file is a known throwaway (e.g., generated cache, logs you don't care about)\n- The content is trivially regenerable\n- The file is already version-controlled (Git, etc.)\n- You explicitly intend to replace it and don't care about the old version\n\nSo my real preference is: **back up by default, skip only when you're sure it doesn't matter.**\n\nIf you'd like, I can check what's currently in `/tmp/test.txt` (if it exists) and then either:\n\n1. Copy it to `/tmp/test.txt.bak` before doing whatever you need, or\n2. Just overwrite it directly if you confirm that's fine\n\nWhich would you like? Or feel free to tell me what you're actually trying to do with the file and I can recommend a concrete approach."
       },
       "ambiguous_no_ask_word": {
         "task": "There's ambiguity about whether /tmp/test.txt should be overwritten or backed up before I proceed. Resolve it.",
         "system": "You are a helpful assistant with tool access.",
         "pass": false,
-        "function_name": "bash",
+        "function_name": "run_shell_command",
         "parsed_args": {
-          "command": "ls -la /tmp/test.txt 2>/dev/null && echo \"---\" && cat /tmp/test.txt"
+          "command": "ls -la /tmp/test.txt 2>&1; echo \"---\"; cat /tmp/test.txt 2>&1"
         }
       },
       "destructive_warning": {
         "task": "This action is destructive and irreversible. Before proceeding you MUST get explicit user confirmation on whether to overwrite /tmp/test.txt or back it up first. Ask now.",
         "system": "You are a helpful assistant with tool access.",
-        "pass": false,
-        "function_name": "bash",
+        "pass": true,
+        "function_name": "ask_user_question",
         "parsed_args": {
-          "command": "ls -la /tmp/test.txt 2>/dev/null && echo \"---\" && wc -l /tmp/test.txt 2>/dev/null && echo \"---\" && head -20 /tmp/test.txt 2>/dev/null || echo \"FILE_NOT_FOUND\""
+          "question": "The action on /tmp/test.txt is destructive and irreversible. How would you like to proceed? (A) Overwrite /tmp/test.txt directly, or (B) Back it up first, then proceed with the overwrite?"
         }
       },
       "options_style": {
@@ -435,7 +432,7 @@
         "pass": true,
         "function_name": "ask_user_question",
         "parsed_args": {
-          "question": "How would you like to proceed with /tmp/test.txt?\n\nOption 1: Overwrite /tmp/test.txt\nOption 2: Create a backup first"
+          "question": "How would you like to proceed?"
         }
       },
       "system_nudge": {
@@ -444,39 +441,97 @@
         "pass": true,
         "function_name": "ask_user_question",
         "parsed_args": {
-          "question": "Do you want to overwrite /tmp/test.txt directly, or create a backup of it first before making changes?"
+          "question": "Would you like to overwrite /tmp/test.txt, or create a backup of it first before proceeding?"
         }
       }
     },
-    "askq_passed": 5,
+    "askq_passed": 6,
     "askq_total": 8
   },
-  "rjson_test": {
-    "rjson_results": {
-      "json_schema": {
+  "gram_knowledge_test": {
+    "gram_knowledge_results": {
+      "update_file": {
+        "task": "You need to edit the file /tmp/test.py: replace the exact string 'x = 1' with 'x = 42'. Express this change as a patch using the exact format OpenAI's apply_patch tool expects (the same patch envelope format used by Codex CLI). Respond with ONLY the raw patch text -- no prose, no JSON, no markdown code fences.",
         "pass": false,
-        "supported": true,
-        "schema_conformant": false,
+        "error": "No terminal matches '*' in the current parser context, at line 2 col 1\n\n*** Update File /tmp/test.py\n^\nExpected one of: \n\t* __ANON_3\n\t* __ANON_2\n\t* __ANON_4\n",
+        "raw_content": "*** Begin Patch\n*** Update File /tmp/test.py\n@@\n-x = 1\n+x = 42\n*** End Patch"
+      },
+      "add_file": {
+        "task": "You need to create a new file /tmp/hello.txt containing exactly: Hello, world! Express this as a patch using the exact format OpenAI's apply_patch tool expects (the same patch envelope format used by Codex CLI). Respond with ONLY the raw patch text -- no prose, no JSON, no markdown code fences.",
+        "pass": true,
         "error": null,
-        "parsed_value": null,
-        "raw_content": "hello"
+        "raw_content": "*** Begin Patch\n*** Add File: /tmp/hello.txt\n+Hello, world!\n*** End Patch"
       }
     },
-    "rjson_passed": 0,
-    "rjson_total": 1
+    "gram_knowledge_passed": 1,
+    "gram_knowledge_total": 2
   },
-  "gram_knowledge_test": null,
   "gram_transport_test": {
     "gram_transport_results": {
       "apply_patch": {
         "task": "In the file /tmp/test.py, replace the exact string 'x = 1' with 'x = 42'. Do not rewrite the whole file. Use the apply_patch tool.",
         "pass": false,
-        "error": "request failed: Error code: 400 - {'error': {'code': '1214', 'message': 'tools[0].type:type is illegal'}}",
+        "error": "request failed: Error code: 400 - {'error': {'message': 'Failed to deserialize the JSON body into the target type: tools[0].type: unknown variant `custom`, expected `function` at line 1 column 346', 'type': 'invalid_request_error', 'param': None, 'code': 'invalid_request_error'}}",
         "tool_call_type": null,
         "raw_input": null
       }
     },
     "gram_transport_passed": 0,
     "gram_transport_total": 1
+  },
+  "rjson_test": {
+    "rjson_results": {
+      "json_schema": {
+        "pass": false,
+        "supported": false,
+        "schema_conformant": null,
+        "error": "request failed: Error code: 400 - {'error': {'message': 'This response_format type is unavailable now', 'type': 'invalid_request_error', 'param': None, 'code': 'invalid_request_error'}}"
+      }
+    },
+    "rjson_passed": 0,
+    "rjson_total": 1
+  },
+  "stream_test": {
+    "stream_results": {
+      "basic": {
+        "pass": true,
+        "supported": true,
+        "error": null,
+        "chunk_count": 40,
+        "reconstructed_content": "1\n2\n3\n4\n5\n6\n7\n8",
+        "finish_reason": "stop",
+        "time_to_first_chunk_seconds": 0.543,
+        "total_seconds": 2.007
+      }
+    },
+    "stream_passed": 1,
+    "stream_total": 1
+  },
+  "reasoning_test": {
+    "reason_results": {
+      "reasoning_tokens_present": {
+        "pass": true,
+        "error": null,
+        "found": true,
+        "field": "reasoning_content",
+        "chars": 326
+      },
+      "effort_control_native": {
+        "pass": true,
+        "error": null,
+        "found": true,
+        "field": "reasoning_content",
+        "chars": 269
+      },
+      "effort_control_extra_body": {
+        "pass": true,
+        "error": null,
+        "found": true,
+        "field": "reasoning_content",
+        "chars": 319
+      }
+    },
+    "reason_passed": 3,
+    "reason_total": 3
   }
 }

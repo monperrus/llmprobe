@@ -277,20 +277,6 @@
   "quote_test": null,
   "token_efficiency_test": null,
   "askq_test": null,
-  "patch_syntax_test": null,
-  "gram_test": {
-    "gram_results": {
-      "apply_patch": {
-        "task": "In the file /tmp/test.py, replace the exact string 'x = 1' with 'x = 42'. Do not rewrite the whole file. Use the apply_patch tool.",
-        "pass": false,
-        "error": "request failed: /home/martin/bin/copilot-gpt-5-mini-completions.py exited 1: Traceback (most recent call last):\n  File \"/home/martin/bin/copilot-gpt-5-mini-completions.py\", line 101, in <module>\n    main()\n    ~~~~^^\n  File \"/home/martin/bin/copilot-gpt-5-mini-completions.py\", line 96, in main\n    resp.raise_for_status()\n    ~~~~~~~~~~~~~~~~~~~~~^^\n  File \"/home/martin/.local/lib/python3.13/site-packages/requests/models.py\", line 1167, in raise_for_status\n    raise HTTPError(http_error_msg, response=self)\nreque",
-        "tool_call_type": null,
-        "raw_input": null
-      }
-    },
-    "gram_passed": 0,
-    "gram_total": 1
-  },
   "api_type": "OpenAI Completions",
   "rjson_test": {
     "rjson_results": {
@@ -305,5 +291,19 @@
     },
     "rjson_passed": 1,
     "rjson_total": 1
+  },
+  "gram_knowledge_test": null,
+  "gram_transport_test": {
+    "gram_transport_results": {
+      "apply_patch": {
+        "task": "In the file /tmp/test.py, replace the exact string 'x = 1' with 'x = 42'. Do not rewrite the whole file. Use the apply_patch tool.",
+        "pass": false,
+        "error": "request failed: /home/martin/bin/copilot-gpt-5-mini-completions.py exited 1: Traceback (most recent call last):\n  File \"/home/martin/bin/copilot-gpt-5-mini-completions.py\", line 101, in <module>\n    main()\n    ~~~~^^\n  File \"/home/martin/bin/copilot-gpt-5-mini-completions.py\", line 96, in main\n    resp.raise_for_status()\n    ~~~~~~~~~~~~~~~~~~~~~^^\n  File \"/home/martin/.local/lib/python3.13/site-packages/requests/models.py\", line 1167, in raise_for_status\n    raise HTTPError(http_error_msg, response=self)\nreque",
+        "tool_call_type": null,
+        "raw_input": null
+      }
+    },
+    "gram_transport_passed": 0,
+    "gram_transport_total": 1
   }
 }
